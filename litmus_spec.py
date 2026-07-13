@@ -160,3 +160,72 @@ def aggregate_constraints(per_case: list) -> dict:
         "by_kind": by_kind_rate,
         "n_cases": n_cases,
     }
+
+
+# ---------------------------------------------------------------------------
+# case loader
+# ---------------------------------------------------------------------------
+
+class CaseError(Exception):
+    pass
+
+
+def _require(obj: dict, key: str, ln: int):
+    if key not in obj:
+        raise CaseError(f"line {ln}: missing required field '{key}'")
+    return obj[key]
+
+
+def _load_constraint_line(obj: dict, ln: int) -> "ConstraintCase":
+    cid = _require(obj, "id", ln)
+    prompt = _require(obj, "prompt", ln)
+    raw_checks = _require(obj, "checks", ln)
+    checks = []
+    for chk in raw_checks:
+        kind = chk.get("kind")
+        if kind not in CHECKS:
+            raise CaseError(f"line {ln}: unknown check kind '{kind}'")
+        spec = CHECKS[kind].params
+        params = {}
+        for pname, ptype in spec.items():
+            if pname not in chk:
+                raise CaseError(f"line {ln}: check '{kind}' missing param '{pname}'")
+            val = chk[pname]
+            if not isinstance(val, ptype) or isinstance(val, bool) and ptype is int:
+                raise CaseError(
+                    f"line {ln}: check '{kind}' param '{pname}' must be "
+                    f"{ptype.__name__}, got {type(val).__name__}")
+            params[pname] = val
+        checks.append((kind, params))
+    return ConstraintCase(id=cid, prompt=prompt, checks=checks)
+
+
+def _load_tool_line(obj: dict, ln: int) -> "ToolCase":
+    cid = _require(obj, "id", ln)
+    prompt = _require(obj, "prompt", ln)
+    tools = _require(obj, "tools", ln)
+    expect = _require(obj, "expect", ln)
+    if "tool" not in expect:
+        raise CaseError(f"line {ln}: expect missing 'tool'")
+    if not isinstance(tools, list) or not tools:
+        raise CaseError(f"line {ln}: 'tools' must be a non-empty list")
+    return ToolCase(id=cid, prompt=prompt, tools=tools, expect=expect)
+
+
+def load_cases(path: str, profile: str) -> list:
+    loader = {"constraints": _load_constraint_line,
+              "tool-calling": _load_tool_line}.get(profile)
+    if loader is None:
+        raise CaseError(f"unknown profile '{profile}'")
+    cases = []
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError as e:
+                raise CaseError(f"line {i}: invalid JSON ({e})")
+            cases.append(loader(obj, i))
+    return cases
