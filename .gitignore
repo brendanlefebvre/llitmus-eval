@@ -1,0 +1,7 @@
+# Downloaded reference corpus (public-domain Gatsby, fetched at setup)
+reference.txt
+# venvs / caches
+.venv-litmus/
+.venv*/
+__pycache__/
+*.pyc
