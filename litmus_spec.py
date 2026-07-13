@@ -237,3 +237,65 @@ def load_cases(path: str, profile: str) -> list:
                 raise CaseError(f"line {i}: top-level value must be a JSON object")
             cases.append(loader(obj, i))
     return cases
+
+
+# ---------------------------------------------------------------------------
+# tool-call parsers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParsedCall:
+    well_formed: bool
+    tool: Optional[str]
+    arguments: Optional[dict]
+    detail: str
+
+
+def _first_json_object(text: str) -> Optional[dict]:
+    """Return the first balanced {...} JSON object in text, or None."""
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except ValueError:
+                        start = -1
+    return None
+
+
+def parse_prompted(text: str) -> ParsedCall:
+    if not text.strip():
+        return ParsedCall(False, None, None, "truncated")
+    obj = _first_json_object(text)
+    if obj is None or "tool" not in obj:
+        return ParsedCall(False, None, None, "no {tool,arguments} object found")
+    tool = obj["tool"]
+    if tool is None:
+        return ParsedCall(True, None, None, "explicit abstention")
+    return ParsedCall(True, tool, obj.get("arguments") or {}, "ok")
+
+
+def _call_from_name_obj(obj: Optional[dict], detail: str) -> ParsedCall:
+    if obj is None or "name" not in obj:
+        return ParsedCall(False, None, None, "no name/arguments object found")
+    return ParsedCall(True, obj["name"], obj.get("arguments") or {}, detail)
+
+
+def parse_native(text: str) -> ParsedCall:
+    if not text.strip():
+        return ParsedCall(False, None, None, "truncated")
+    m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL)
+    if m:
+        return _call_from_name_obj(_first_json_object(m.group(1)), "qwen/hermes tag")
+    m = re.search(r"<\|python_tag\|>(.*)", text, re.DOTALL)
+    if m:
+        return _call_from_name_obj(_first_json_object(m.group(1)), "llama python_tag")
+    return _call_from_name_obj(_first_json_object(text), "generic json")
