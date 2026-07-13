@@ -18,6 +18,7 @@ dependencies = ["psutil"]
 # Apple-Silicon MLX runtime. 1-bit Bonsai models additionally need the PrismML MLX fork:
 #   pip install "mlx @ git+https://github.com/PrismML-Eng/mlx.git@prism"
 mlx = ["mlx-lm"]
+dev = ["pytest>=8.0"]
 
 [project.urls]
 Homepage = "https://github.com/brendanlefebvre/llitmus-eval"
@@ -28,3 +29,6 @@ litmus = "litmus:main"
 
 [tool.setuptools]
 py-modules = ["litmus", "litmus_cuda"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
