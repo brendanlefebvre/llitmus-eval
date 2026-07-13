@@ -112,3 +112,51 @@ def _valid_json(text: str, params: dict) -> CheckResult:
 def _regex_match(text: str, params: dict) -> CheckResult:
     ok = re.search(params["pattern"], text) is not None
     return CheckResult(ok, f"pattern {'matched' if ok else 'no match'}")
+
+
+# ---------------------------------------------------------------------------
+# case types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConstraintCase:
+    id: str
+    prompt: str
+    checks: list  # list[tuple[str, dict]] — (kind, params)
+
+
+@dataclass
+class ToolCase:
+    id: str
+    prompt: str
+    tools: list   # list[dict] JSON-Schema
+    expect: dict  # {"tool": str|None, "arguments": dict}
+
+
+# ---------------------------------------------------------------------------
+# constraint scoring
+# ---------------------------------------------------------------------------
+
+def score_constraint_case(text: str, case: "ConstraintCase") -> list:
+    out = []
+    for kind, params in case.checks:
+        res = CHECKS[kind].fn(text, params)
+        out.append({"kind": kind, "passed": res.passed, "detail": res.detail})
+    return out
+
+
+def aggregate_constraints(per_case: list) -> dict:
+    n_cases = len(per_case)
+    strict_pass = sum(1 for checks in per_case if checks and all(c["passed"] for c in checks))
+    all_checks = [c for checks in per_case for c in checks]
+    loose = (sum(1 for c in all_checks if c["passed"]) / len(all_checks)) if all_checks else 0.0
+    by_kind: dict = {}
+    for c in all_checks:
+        by_kind.setdefault(c["kind"], []).append(c["passed"])
+    by_kind_rate = {k: sum(v) / len(v) for k, v in by_kind.items()}
+    return {
+        "strict": (strict_pass / n_cases) if n_cases else 0.0,
+        "loose": loose,
+        "by_kind": by_kind_rate,
+        "n_cases": n_cases,
+    }
