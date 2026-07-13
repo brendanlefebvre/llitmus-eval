@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llitmus-eval"
+version = "0.1.0"
+description = "Litmus - a local-LLM eval suite for MLX inference on Apple Silicon; the measurement layer of the Loxo eval-driven router."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Brendan LeFebvre", email = "brendanl@brendanl.net" }]
+keywords = ["llm", "evaluation", "benchmark", "mlx", "apple-silicon", "inference", "loxo"]
+dependencies = ["psutil"]
+
+[project.optional-dependencies]
+# Apple-Silicon MLX runtime. 1-bit Bonsai models additionally need the PrismML MLX fork:
+#   pip install "mlx @ git+https://github.com/PrismML-Eng/mlx.git@prism"
+mlx = ["mlx-lm"]
+
+[project.urls]
+Homepage = "https://github.com/brendanlefebvre/llitmus-eval"
+Repository = "https://github.com/brendanlefebvre/llitmus-eval"
+
+[project.scripts]
+litmus = "litmus:main"
+
+[tool.setuptools]
+py-modules = ["litmus", "litmus_cuda"]
