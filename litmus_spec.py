@@ -180,8 +180,12 @@ def _load_constraint_line(obj: dict, ln: int) -> "ConstraintCase":
     cid = _require(obj, "id", ln)
     prompt = _require(obj, "prompt", ln)
     raw_checks = _require(obj, "checks", ln)
+    if not isinstance(raw_checks, list):
+        raise CaseError(f"line {ln}: 'checks' must be a list")
     checks = []
     for chk in raw_checks:
+        if not isinstance(chk, dict):
+            raise CaseError(f"line {ln}: each check must be an object")
         kind = chk.get("kind")
         if kind not in CHECKS:
             raise CaseError(f"line {ln}: unknown check kind '{kind}'")
@@ -205,6 +209,8 @@ def _load_tool_line(obj: dict, ln: int) -> "ToolCase":
     prompt = _require(obj, "prompt", ln)
     tools = _require(obj, "tools", ln)
     expect = _require(obj, "expect", ln)
+    if not isinstance(expect, dict):
+        raise CaseError(f"line {ln}: 'expect' must be an object")
     if "tool" not in expect:
         raise CaseError(f"line {ln}: expect missing 'tool'")
     if not isinstance(tools, list) or not tools:
@@ -227,5 +233,7 @@ def load_cases(path: str, profile: str) -> list:
                 obj = json.loads(line)
             except ValueError as e:
                 raise CaseError(f"line {i}: invalid JSON ({e})")
+            if not isinstance(obj, dict):
+                raise CaseError(f"line {i}: top-level value must be a JSON object")
             cases.append(loader(obj, i))
     return cases

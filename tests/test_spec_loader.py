@@ -61,3 +61,37 @@ def test_line_number_in_error(tmp_path):
     )
     with pytest.raises(CaseError, match="line 2"):
         load_cases(path, "constraints")
+
+
+def test_non_object_line_raises(tmp_path):
+    path = write(tmp_path, "c.jsonl", "5")
+    with pytest.raises(CaseError, match="line 1"):
+        load_cases(path, "constraints")
+
+
+def test_non_list_checks_raises(tmp_path):
+    path = write(tmp_path, "c.jsonl",
+                 '{"id":"a","prompt":"p","checks":{"kind":"all_lowercase"}}')
+    with pytest.raises(CaseError, match="checks.*list"):
+        load_cases(path, "constraints")
+
+
+def test_non_dict_check_entry_raises(tmp_path):
+    path = write(tmp_path, "c.jsonl",
+                 '{"id":"a","prompt":"p","checks":["all_lowercase"]}')
+    with pytest.raises(CaseError, match="check.*object"):
+        load_cases(path, "constraints")
+
+
+def test_non_dict_expect_raises(tmp_path):
+    path = write(tmp_path, "t.jsonl",
+                 '{"id":"t","prompt":"p","tools":[{"name":"x"}],"expect":5}')
+    with pytest.raises(CaseError, match="expect.*object"):
+        load_cases(path, "tool-calling")
+
+
+def test_bool_for_int_param_raises(tmp_path):
+    path = write(tmp_path, "c.jsonl",
+                 '{"id":"a","prompt":"p","checks":[{"kind":"exact_bullets","n":true}]}')
+    with pytest.raises(CaseError, match="n"):
+        load_cases(path, "constraints")
