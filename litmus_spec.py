@@ -323,26 +323,34 @@ def parse_native(text: str) -> ParsedCall:
 # tool-call scoring
 # ---------------------------------------------------------------------------
 
-def score_tool_call(parsed: "ParsedCall", expect: dict) -> dict:
+def score_tool_call(parsed: "ParsedCall", expect: dict, native: bool = False) -> dict:
     is_abstention = expect.get("tool") is None
-
-    # A not-well-formed parse yields tool=None; never let that masquerade as a
-    # deliberate no-call. All credit is gated on well_formed.
     abstained_ok = None
     args_ok = None
     if is_abstention:
-        abstained_ok = parsed.well_formed and parsed.tool is None
+        if native:
+            # Native function-calling has no explicit "no-call" token: a model
+            # abstains simply by not emitting a tool call, which the parser
+            # reports as tool=None. On an abstention case that absence IS the
+            # correct answer, so treat it as a clean no-call.
+            abstained_ok = parsed.tool is None
+            well_formed = True if abstained_ok else parsed.well_formed
+        else:
+            # Prompted convention asks for an explicit {"tool": null}; a garbage
+            # (not well_formed) output must not be credited as an abstention.
+            abstained_ok = parsed.well_formed and parsed.tool is None
+            well_formed = parsed.well_formed
         right_tool = abstained_ok
     else:
+        well_formed = parsed.well_formed
         right_tool = parsed.well_formed and parsed.tool == expect.get("tool")
         if right_tool:
             want = expect.get("arguments") or {}
             got = parsed.arguments or {}
             args_ok = (set(got.keys()) == set(want.keys())
                        and all(got.get(k) == v for k, v in want.items()))
-
     return {
-        "well_formed": parsed.well_formed,
+        "well_formed": well_formed,
         "right_tool": right_tool,
         "args_ok": args_ok,
         "abstained_ok": abstained_ok,
@@ -432,26 +440,33 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool) -> dict:
     prompted_scores, native_scores, records, errored = [], [], [], []
     native_parse_failed = 0
     for case in cases:
-        rec = {"id": case.id, "prompted": None, "native": None}
+        rec = {"id": case.id, "prompted": None, "native": None,
+               "prompted_output": None, "native_output": None}
         try:
             p_prompt = build_prompted_tool_prompt(tokenizer, case)
-            p_score = score_tool_call(parse_prompted(generate_fn(p_prompt)), case.expect)
+            p_text = generate_fn(p_prompt)
+            p_score = score_tool_call(parse_prompted(p_text), case.expect)
+            n_text = None
             n_score = None
             n_failed = False
             if native:
                 n_prompt = build_native_tool_prompt(tokenizer, case)
-                n_parsed = parse_native(generate_fn(n_prompt))
-                n_failed = not n_parsed.well_formed
-                n_score = score_tool_call(n_parsed, case.expect)
+                n_text = generate_fn(n_prompt)
+                n_parsed = parse_native(n_text)
+                # A no-call on an abstention case is correct, not a parse failure.
+                n_failed = (not n_parsed.well_formed
+                            and case.expect.get("tool") is not None)
+                n_score = score_tool_call(n_parsed, case.expect, native=True)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
             continue
-        # commit only after both legs succeeded, so an errored case contributes nothing
         prompted_scores.append(p_score)
         rec["prompted"] = p_score
+        rec["prompted_output"] = p_text[:200]
         if native:
             native_scores.append(n_score)
             rec["native"] = n_score
+            rec["native_output"] = n_text[:200]
             if n_failed:
                 native_parse_failed += 1
         records.append(rec)
@@ -459,8 +474,6 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool) -> dict:
         "aggregate": {
             "prompted": aggregate_tool(prompted_scores),
             "native": aggregate_tool(native_scores) if native else None,
-            # distinct from well_formed=False and from abstention: how many
-            # native outputs the multi-format parser could not read at all.
             "native_parse_failed": native_parse_failed if native else None,
         },
         "cases": records, "errored": errored,
