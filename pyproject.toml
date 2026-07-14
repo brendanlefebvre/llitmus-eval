@@ -28,7 +28,7 @@ Repository = "https://github.com/brendanlefebvre/llitmus-eval"
 litmus = "litmus:main"
 
 [tool.setuptools]
-py-modules = ["litmus", "litmus_cuda"]
+py-modules = ["litmus", "litmus_common", "litmus_spec", "litmus_cuda"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
