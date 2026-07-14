@@ -521,3 +521,74 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+import argparse
+import os
+
+DEFAULT_CASES = {
+    "tool-calling": "cases/tool_calling.jsonl",
+    "constraints": "cases/constraints.jsonl",
+}
+DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512}
+
+
+def _mlx_generate(model, tokenizer, prompt: str, max_tokens: int) -> str:
+    from litmus_common import _resp_text, stream_generate
+    chunks = []
+    for resp in stream_generate(model, tokenizer, prompt, max_tokens=max_tokens):
+        chunks.append(_resp_text(resp))
+    return "".join(chunks)
+
+
+def main() -> None:
+    from litmus_common import _targets_for, _load_timed, _clear_cache
+
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--profile", required=True,
+                    choices=["tool-calling", "constraints"])
+    ap.add_argument("--cases", default=None, help="JSONL case file (default per profile)")
+    ap.add_argument("--sizes", default="1.7B,4B,8B")
+    ap.add_argument("--repo", default=None)
+    ap.add_argument("--label", default=None)
+    ap.add_argument("--max-tokens", type=int, default=None)
+    ap.add_argument("--out-dir", default=".")
+    args = ap.parse_args()
+
+    cases_path = args.cases or DEFAULT_CASES[args.profile]
+    max_tokens = args.max_tokens or DEFAULT_MAX_TOKENS[args.profile]
+    cases = load_cases(cases_path, args.profile)   # fail-fast before loading a model
+    print(f"loaded {len(cases)} cases from {cases_path}")
+
+    for label, repo in _targets_for(args):
+        print(f"\n=== {label}: loading {repo} ===")
+        model, tokenizer, t_load = _load_timed(repo)
+        print(f"loaded in {t_load:.1f}s")
+        gen = lambda p: _mlx_generate(model, tokenizer, p, max_tokens)
+
+        if args.profile == "constraints":
+            result = run_constraints(cases, tokenizer, gen)
+            print(format_constraint_table(label, result))
+            conv = {"prompted": True, "native": False}
+        else:
+            native = supports_native_tools(tokenizer)
+            result = run_tool_calling(cases, tokenizer, gen, native=native)
+            print(format_tool_table(label, result))
+            conv = {"prompted": True, "native": native}
+
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label)
+        out_path = os.path.join(args.out_dir, f"results_{args.profile}_{safe}.json")
+        write_sidecar(out_path, args.profile, repo, label, conv, result)
+        print(f"sidecar written: {out_path}")
+
+        del model, tokenizer
+        _clear_cache()
+
+
+if __name__ == "__main__":
+    main()

@@ -41,6 +41,18 @@ python litmus.py --repo <hf-org/model-mlx>        # any MLX repo, not just Bonsa
 `litmus_cuda.py` is the CUDA/PyTorch counterpart for rented-GPU runs (same prompts,
 comparable numbers).
 
+### Spec-check (capability evals)
+
+Objective, fixed-input checks of tool-calling and instruction-following:
+
+    python litmus_spec.py --profile constraints --repo <hf-org/model-mlx>
+    python litmus_spec.py --profile tool-calling --repo <hf-org/model-mlx>
+
+Tool-calling reports a prompted-JSON column for every model plus a native
+`tools=` column where the chat template supports it (and the gap between them).
+Constraint-following reports IFEval-style strict/loose accuracy. Each run writes
+a `results_<profile>_<label>.json` sidecar for downstream (Loxo) consumption.
+
 ## Why "Litmus"
 
 A litmus test reveals a property with one clean check. That's the job: apply the
