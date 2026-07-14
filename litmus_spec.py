@@ -252,10 +252,28 @@ class ParsedCall:
 
 
 def _first_json_object(text: str) -> Optional[dict]:
-    """Return the first balanced {...} JSON object in text, or None."""
+    """Return the first balanced {...} JSON object in text, or None.
+
+    Brace counting ignores { and } that occur inside JSON string literals
+    (respecting backslash escapes), so a brace in an argument's string value
+    does not corrupt the balance.
+    """
     depth = 0
     start = -1
+    in_str = False
+    escape = False
     for i, ch in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
         if ch == "{":
             if depth == 0:
                 start = i
