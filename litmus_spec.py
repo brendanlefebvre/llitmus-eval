@@ -317,3 +317,43 @@ def parse_native(text: str) -> ParsedCall:
     if m:
         return _call_from_name_obj(_first_json_object(m.group(1)), "llama python_tag")
     return _call_from_name_obj(_first_json_object(text), "generic json")
+
+
+# ---------------------------------------------------------------------------
+# tool-call scoring
+# ---------------------------------------------------------------------------
+
+def score_tool_call(parsed: "ParsedCall", expect: dict) -> dict:
+    is_abstention = expect.get("tool") is None
+
+    # A not-well-formed parse yields tool=None; never let that masquerade as a
+    # deliberate no-call. All credit is gated on well_formed.
+    abstained_ok = None
+    args_ok = None
+    if is_abstention:
+        abstained_ok = parsed.well_formed and parsed.tool is None
+        right_tool = abstained_ok
+    else:
+        right_tool = parsed.well_formed and parsed.tool == expect.get("tool")
+        if right_tool:
+            want = expect.get("arguments") or {}
+            got = parsed.arguments or {}
+            args_ok = (set(got.keys()) == set(want.keys())
+                       and all(got.get(k) == v for k, v in want.items()))
+
+    return {
+        "well_formed": parsed.well_formed,
+        "right_tool": right_tool,
+        "args_ok": args_ok,
+        "abstained_ok": abstained_ok,
+    }
+
+
+def _rate(vals: list) -> Optional[float]:
+    present = [v for v in vals if v is not None]
+    return (sum(1 for v in present if v) / len(present)) if present else None
+
+
+def aggregate_tool(per_case: list) -> dict:
+    dims = ["well_formed", "right_tool", "args_ok", "abstained_ok"]
+    return {d: _rate([c[d] for c in per_case]) for d in dims}
