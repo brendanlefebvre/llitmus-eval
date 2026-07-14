@@ -357,3 +357,51 @@ def _rate(vals: list) -> Optional[float]:
 def aggregate_tool(per_case: list) -> dict:
     dims = ["well_formed", "right_tool", "args_ok", "abstained_ok"]
     return {d: _rate([c[d] for c in per_case]) for d in dims}
+
+
+# ---------------------------------------------------------------------------
+# elicitation
+# ---------------------------------------------------------------------------
+
+_PROMPTED_SYSTEM = (
+    "You have access to these tools (JSON schemas):\n{schemas}\n\n"
+    "Decide whether a tool is needed for the user's request. Respond with "
+    "ONLY a single JSON object and nothing else, in exactly this shape:\n"
+    '{{"tool": <tool name as a string, or null if no tool applies>, '
+    '"arguments": {{<argument name>: <value>, ...}}}}'
+)
+
+
+def _chat(tokenizer, messages, tools=None) -> str:
+    return tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False, tools=tools)
+
+
+def build_prompted_tool_prompt(tokenizer, case: "ToolCase") -> str:
+    schemas = json.dumps(case.tools, indent=2)
+    system = _PROMPTED_SYSTEM.format(schemas=schemas)
+    return _chat(tokenizer, [
+        {"role": "system", "content": system},
+        {"role": "user", "content": case.prompt},
+    ])
+
+
+def supports_native_tools(tokenizer) -> bool:
+    msgs = [{"role": "user", "content": "ping"}]
+    probe_tool = [{"type": "function",
+                   "function": {"name": "_probe", "parameters": {}}}]
+    try:
+        with_tools = _chat(tokenizer, msgs, tools=probe_tool)
+        without = _chat(tokenizer, msgs, tools=None)
+    except Exception:
+        return False
+    return with_tools != without
+
+
+def build_native_tool_prompt(tokenizer, case: "ToolCase") -> str:
+    return _chat(tokenizer, [{"role": "user", "content": case.prompt}],
+                 tools=case.tools)
+
+
+def build_constraint_prompt(tokenizer, case: "ConstraintCase") -> str:
+    return _chat(tokenizer, [{"role": "user", "content": case.prompt}])
