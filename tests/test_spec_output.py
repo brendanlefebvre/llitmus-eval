@@ -10,6 +10,7 @@ def test_tool_table_shows_prompted_and_native_and_gap():
     table = format_tool_table("Qwen", result)
     assert "prompted" in table and "native" in table
     assert "Qwen" in table
+    assert "gap(right)" in table
 
 
 def test_tool_table_handles_no_native():

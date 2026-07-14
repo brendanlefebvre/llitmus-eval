@@ -77,3 +77,14 @@ def test_aggregate_excludes_none_from_denominator():
     assert agg["right_tool"] == 2 / 3
     assert agg["args_ok"] == 1.0          # only one non-None, and it passed
     assert agg["abstained_ok"] == 1.0     # only one non-None, and it passed
+
+
+def test_rate_all_none_returns_none():
+    from litmus_spec import _rate
+    assert _rate([None, None]) is None
+
+
+def test_args_ok_missing_key_fails():
+    p = ParsedCall(True, "get_weather", {}, "ok")  # missing required 'location'
+    s = score_tool_call(p, {"tool": "get_weather", "arguments": {"location": "Paris"}})
+    assert s["args_ok"] is False

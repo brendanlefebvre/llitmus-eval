@@ -1,4 +1,3 @@
-import pytest
 from litmus_spec import (
     ToolCase, build_prompted_tool_prompt, supports_native_tools,
     build_native_tool_prompt, build_constraint_prompt, ConstraintCase,

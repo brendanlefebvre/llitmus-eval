@@ -213,9 +213,12 @@ output to a temp file):
  "cases": [ {"id": "tool-012", "prompted": {"...per-dimension..."}, "native": null} ]}
 ```
 
-Both profiles produce the same per-case record shape — `{id, profile,
-output_sample, checks:[{kind, passed, detail}], ...}` — so aggregation and the
-JSON sidecar are one code path, not two.
+The two profiles do *not* share a per-case record shape: constraint records are
+`{id, checks, output_sample}` and tool-calling records are `{id, prompted,
+native, prompted_output, native_output}`. What's shared is the output seam —
+`write_sidecar` takes each profile's `result["cases"]` opaquely and writes it
+generically, so the sidecar and table formatters don't need a common record
+shape to stay one code path at that boundary.
 
 ## Error handling & edge cases
 
