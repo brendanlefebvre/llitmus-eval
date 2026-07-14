@@ -435,21 +435,25 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool) -> dict:
         rec = {"id": case.id, "prompted": None, "native": None}
         try:
             p_prompt = build_prompted_tool_prompt(tokenizer, case)
-            p_parsed = parse_prompted(generate_fn(p_prompt))
-            p_score = score_tool_call(p_parsed, case.expect)
-            prompted_scores.append(p_score)
-            rec["prompted"] = p_score
+            p_score = score_tool_call(parse_prompted(generate_fn(p_prompt)), case.expect)
+            n_score = None
+            n_failed = False
             if native:
                 n_prompt = build_native_tool_prompt(tokenizer, case)
                 n_parsed = parse_native(generate_fn(n_prompt))
-                if not n_parsed.well_formed:
-                    native_parse_failed += 1
+                n_failed = not n_parsed.well_formed
                 n_score = score_tool_call(n_parsed, case.expect)
-                native_scores.append(n_score)
-                rec["native"] = n_score
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
             continue
+        # commit only after both legs succeeded, so an errored case contributes nothing
+        prompted_scores.append(p_score)
+        rec["prompted"] = p_score
+        if native:
+            native_scores.append(n_score)
+            rec["native"] = n_score
+            if n_failed:
+                native_parse_failed += 1
         records.append(rec)
     return {
         "aggregate": {

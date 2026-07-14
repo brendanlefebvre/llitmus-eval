@@ -67,3 +67,19 @@ def test_run_tool_calling_counts_native_parse_failures():
                 if calls["n"] == 1 else "sorry, no idea")
     result = run_tool_calling(cases, FakeTokenizer(), gen, native=True)
     assert result["aggregate"]["native_parse_failed"] == 1
+
+
+def test_run_tool_calling_native_error_excludes_prompted_from_aggregate():
+    cases = [ToolCase("t1", "weather?", [{"name": "get_weather"}],
+                      {"tool": "get_weather", "arguments": {"location": "Paris"}})]
+    calls = {"n": 0}
+    def gen(prompt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return '{"tool":"get_weather","arguments":{"location":"Paris"}}'  # prompted OK
+        raise RuntimeError("native call exploded")                            # native leg raises
+    result = run_tool_calling(cases, FakeTokenizer(), gen, native=True)
+    assert result["errored"][0]["id"] == "t1"
+    assert result["cases"] == []
+    # the phantom prompted pass must NOT survive into the aggregate
+    assert result["aggregate"]["prompted"]["right_tool"] is None
