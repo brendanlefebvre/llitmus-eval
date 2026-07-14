@@ -249,6 +249,7 @@ class ParsedCall:
     tool: Optional[str]
     arguments: Optional[dict]
     detail: str
+    attempted: bool = False  # a tool-call was attempted: a structure was present, or a call parsed
 
 
 def _first_json_object(text: str) -> Optional[dict]:
@@ -298,13 +299,14 @@ def parse_prompted(text: str) -> ParsedCall:
     tool = obj["tool"]
     if tool is None:
         return ParsedCall(True, None, None, "explicit abstention")
-    return ParsedCall(True, tool, obj.get("arguments") or {}, "ok")
+    return ParsedCall(True, tool, obj.get("arguments") or {}, "ok", attempted=True)
 
 
-def _call_from_name_obj(obj: Optional[dict], detail: str) -> ParsedCall:
+def _call_from_name_obj(obj: Optional[dict], detail: str, attempted) -> ParsedCall:
     if obj is None or "name" not in obj:
-        return ParsedCall(False, None, None, "no name/arguments object found")
-    return ParsedCall(True, obj["name"], obj.get("arguments") or {}, detail)
+        return ParsedCall(False, None, None, "no name/arguments object found",
+                          attempted=bool(attempted))
+    return ParsedCall(True, obj["name"], obj.get("arguments") or {}, detail, attempted=True)
 
 
 def parse_native(text: str) -> ParsedCall:
@@ -312,11 +314,11 @@ def parse_native(text: str) -> ParsedCall:
         return ParsedCall(False, None, None, "truncated")
     m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL)
     if m:
-        return _call_from_name_obj(_first_json_object(m.group(1)), "qwen/hermes tag")
+        return _call_from_name_obj(_first_json_object(m.group(1)), "qwen/hermes tag", attempted=True)
     m = re.search(r"<\|python_tag\|>(.*)", text, re.DOTALL)
     if m:
-        return _call_from_name_obj(_first_json_object(m.group(1)), "llama python_tag")
-    return _call_from_name_obj(_first_json_object(text), "generic json")
+        return _call_from_name_obj(_first_json_object(m.group(1)), "llama python_tag", attempted=True)
+    return _call_from_name_obj(_first_json_object(text), "generic json", attempted=None)
 
 
 # ---------------------------------------------------------------------------
@@ -329,11 +331,10 @@ def score_tool_call(parsed: "ParsedCall", expect: dict, native: bool = False) ->
     args_ok = None
     if is_abstention:
         if native:
-            # Native function-calling has no explicit "no-call" token: a model
-            # abstains simply by not emitting a tool call, which the parser
-            # reports as tool=None. On an abstention case that absence IS the
-            # correct answer, so treat it as a clean no-call.
-            abstained_ok = parsed.tool is None
+            # Native FC has no explicit no-call token. A genuine abstention means
+            # NO tool-call structure was attempted; a structure that failed to
+            # parse is an attempted (failed) call, not an abstention.
+            abstained_ok = (not parsed.attempted) and parsed.tool is None
             well_formed = True if abstained_ok else parsed.well_formed
         else:
             # Prompted convention asks for an explicit {"tool": null}; a garbage
@@ -453,9 +454,7 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool) -> dict:
                 n_prompt = build_native_tool_prompt(tokenizer, case)
                 n_text = generate_fn(n_prompt)
                 n_parsed = parse_native(n_text)
-                # A no-call on an abstention case is correct, not a parse failure.
-                n_failed = (not n_parsed.well_formed
-                            and case.expect.get("tool") is not None)
+                n_failed = n_parsed.attempted and not n_parsed.well_formed
                 n_score = score_tool_call(n_parsed, case.expect, native=True)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})

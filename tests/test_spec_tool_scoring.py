@@ -88,3 +88,11 @@ def test_args_ok_missing_key_fails():
     p = ParsedCall(True, "get_weather", {}, "ok")  # missing required 'location'
     s = score_tool_call(p, {"tool": "get_weather", "arguments": {"location": "Paris"}})
     assert s["args_ok"] is False
+
+
+def test_native_abstention_credited_only_without_structure():
+    no_structure = ParsedCall(False, None, None, "no name", attempted=False)
+    assert score_tool_call(no_structure, {"tool": None}, native=True)["abstained_ok"] is True
+    attempted_broken = ParsedCall(False, None, None, "bad json in tag", attempted=True)
+    s = score_tool_call(attempted_broken, {"tool": None}, native=True)
+    assert s["abstained_ok"] is False and s["right_tool"] is False

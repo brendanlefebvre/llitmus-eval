@@ -59,12 +59,12 @@ def test_run_tool_calling_with_native_column():
 def test_run_tool_calling_counts_native_parse_failures():
     cases = [ToolCase("t1", "weather?", [{"name": "get_weather"}],
                       {"tool": "get_weather", "arguments": {"location": "Paris"}})]
-    # 1st generate call = prompted (parseable), 2nd = native (junk)
+    # 1st generate call = prompted (parseable), 2nd = native (malformed structure)
     calls = {"n": 0}
     def gen(prompt):
         calls["n"] += 1
         return ('{"tool":"get_weather","arguments":{"location":"Paris"}}'
-                if calls["n"] == 1 else "sorry, no idea")
+                if calls["n"] == 1 else '<tool_call>{{"name":"get_weather"}}</tool_call>')
     result = run_tool_calling(cases, FakeTokenizer(), gen, native=True)
     assert result["aggregate"]["native_parse_failed"] == 1
 
@@ -80,6 +80,18 @@ def test_run_tool_calling_native_abstention_scored_correct():
     assert result["aggregate"]["native"]["abstained_ok"] == 1.0
     assert result["aggregate"]["native"]["right_tool"] == 1.0
     assert result["aggregate"]["native_parse_failed"] == 0
+
+
+def test_run_tool_calling_native_abstention_with_broken_call_not_credited():
+    cases = [ToolCase("t1", "write a haiku", [{"name": "get_weather"}], {"tool": None})]
+    calls = {"n": 0}
+    def gen(prompt):
+        calls["n"] += 1
+        return ('{"tool":null,"arguments":{}}' if calls["n"] == 1
+                else '<tool_call>{{"name":"get_weather"}}</tool_call>')
+    result = run_tool_calling(cases, FakeTokenizer(), gen, native=True)
+    assert result["aggregate"]["native"]["abstained_ok"] == 0.0
+    assert result["aggregate"]["native_parse_failed"] == 1
 
 
 def test_run_tool_calling_records_raw_output():

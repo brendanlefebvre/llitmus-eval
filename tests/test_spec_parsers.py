@@ -71,3 +71,18 @@ def test_prompted_escaped_quote_then_brace_in_string():
     r = parse_prompted(text)
     assert r.well_formed and r.tool == "echo"
     assert r.arguments == {"msg": 'she said "hi" }'}
+
+
+def test_native_broken_tag_is_attempted_not_wellformed():
+    r = parse_native('<tool_call>{{"name":"get_weather"}}</tool_call>')
+    assert r.well_formed is False and r.attempted is True
+
+
+def test_native_prose_is_not_attempted():
+    r = parse_native("The capital of France is Paris.")
+    assert r.attempted is False and r.well_formed is False
+
+
+def test_native_clean_call_is_attempted():
+    r = parse_native('<tool_call>{"name":"get_weather","arguments":{"location":"Paris"}}</tool_call>')
+    assert r.well_formed is True and r.attempted is True

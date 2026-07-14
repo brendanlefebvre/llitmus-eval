@@ -127,9 +127,17 @@ handled explicitly rather than glossed:
   `well_formed = False`.
 - **Native:** best-effort multi-format parser trying, in order: Qwen/Hermes
   `<tool_call>…</tool_call>`, Llama `<|python_tag|>`, then a generic
-  balanced-JSON fallback. Every native parse failure is recorded in its own
-  `native_parse_failed` tally — distinct from `well_formed=False` and from
-  `abstained` — so the native column's reliability is auditable.
+  balanced-JSON fallback. Native function-calling has no explicit "no-call"
+  token, so `ParsedCall.attempted` distinguishes "a tool-call structure was
+  present" (a `<tool_call>`/`<|python_tag|>` tag matched, or the generic
+  fallback actually parsed an object) from a genuine no-call — prose with no
+  structure at all. A native abstention is credited only when nothing was
+  attempted; a structure that matched but whose inner JSON didn't parse (e.g.
+  a broken/doubled-brace `<tool_call>`) is scored as an attempted, failed
+  call, not a free abstention. `native_parse_failed` counts these
+  attempted-but-unparseable native calls — distinct from `well_formed=False`
+  and from `abstained` — so the native column's parser reliability is
+  auditable independent of expect.
 
 ### Four dimensions, scored independently per case
 
