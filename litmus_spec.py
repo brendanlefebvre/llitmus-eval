@@ -465,3 +465,59 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool) -> dict:
         },
         "cases": records, "errored": errored,
     }
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+def _fmt(v) -> str:
+    return f"{v:.2f}" if isinstance(v, (int, float)) else "  - "
+
+
+def format_tool_table(label: str, result: dict) -> str:
+    agg = result["aggregate"]
+    p = agg["prompted"]
+    lines = [f"{'model':<20} {'conv':<9} {'well':>5} {'right':>6} {'args':>5} {'abst':>5}"]
+    lines.append(f"{label:<20} {'prompted':<9} "
+                 f"{_fmt(p['well_formed']):>5} {_fmt(p['right_tool']):>6} "
+                 f"{_fmt(p['args_ok']):>5} {_fmt(p['abstained_ok']):>5}")
+    n = agg["native"]
+    if n is None:
+        lines.append(f"{'':<20} {'native':<9}  (no native tool support)")
+    else:
+        gap = (p["right_tool"] or 0) - (n["right_tool"] or 0)
+        lines.append(f"{'':<20} {'native':<9} "
+                     f"{_fmt(n['well_formed']):>5} {_fmt(n['right_tool']):>6} "
+                     f"{_fmt(n['args_ok']):>5} {_fmt(n['abstained_ok']):>5}"
+                     f"   gap(right)={gap:+.2f}")
+    return "\n".join(lines)
+
+
+def format_constraint_table(label: str, result: dict) -> str:
+    agg = result["aggregate"]
+    lines = [f"{label}:  strict={agg['strict']:.2f}  loose={agg['loose']:.2f}  "
+             f"(n={agg['n_cases']})"]
+    if agg["by_kind"]:
+        lines.append("  by kind: " + "  ".join(
+            f"{k}={v:.2f}" for k, v in sorted(agg["by_kind"].items())))
+    if result["errored"]:
+        lines.append(f"  errored: {len(result['errored'])} case(s)")
+    return "\n".join(lines)
+
+
+def write_sidecar(path: str, profile: str, model: str, label: str,
+                  convention_support: dict, result: dict) -> None:
+    payload = {
+        "profile": profile,
+        "model": model,
+        "label": label,
+        "convention_support": convention_support,
+        "aggregate": result["aggregate"],
+        "n_cases": result["aggregate"].get("n_cases",
+                                           len(result.get("cases", []))),
+        "cases": result.get("cases", []),
+        "errored": result.get("errored", []),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
