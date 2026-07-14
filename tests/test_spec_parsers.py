@@ -86,3 +86,18 @@ def test_native_prose_is_not_attempted():
 def test_native_clean_call_is_attempted():
     r = parse_native('<tool_call>{"name":"get_weather","arguments":{"location":"Paris"}}</tool_call>')
     assert r.well_formed is True and r.attempted is True
+
+
+def test_native_unclosed_tool_call_is_attempted():
+    # real Qwen behavior: opening <tool_call> tag, no closing tag, malformed JSON
+    text = ('Autumn leaves falling,\nNature\'s symphony ends.\n'
+            '<tool_call>\n{{"name": "send_email", "arguments": {"to": "x"')
+    r = parse_native(text)
+    assert r.attempted is True and r.well_formed is False
+
+
+def test_native_unclosed_tag_with_valid_json_is_parsed():
+    # opening tag, no close, but valid single-brace JSON after -> generic fallback reads it
+    text = '<tool_call>\n{"name": "get_weather", "arguments": {"location": "Rome"}}'
+    r = parse_native(text)
+    assert r.attempted is True and r.well_formed is True and r.tool == "get_weather"

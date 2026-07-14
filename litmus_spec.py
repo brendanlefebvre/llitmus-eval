@@ -302,7 +302,10 @@ def parse_prompted(text: str) -> ParsedCall:
     return ParsedCall(True, tool, obj.get("arguments") or {}, "ok", attempted=True)
 
 
-def _call_from_name_obj(obj: Optional[dict], detail: str, attempted) -> ParsedCall:
+def _call_from_name_obj(obj: Optional[dict], detail: str,
+                        attempted: Optional[bool]) -> ParsedCall:
+    # attempted: True forces an attempt (a structure marker was present); a
+    # falsy/None value means "attempted only if an object actually parsed".
     if obj is None or "name" not in obj:
         return ParsedCall(False, None, None, "no name/arguments object found",
                           attempted=bool(attempted))
@@ -318,7 +321,11 @@ def parse_native(text: str) -> ParsedCall:
     m = re.search(r"<\|python_tag\|>(.*)", text, re.DOTALL)
     if m:
         return _call_from_name_obj(_first_json_object(m.group(1)), "llama python_tag", attempted=True)
-    return _call_from_name_obj(_first_json_object(text), "generic json", attempted=None)
+    # No complete tag pair. An unclosed opening marker still signals an attempted
+    # call (models don't always emit the closing tag). Absent any marker, a
+    # generic JSON object counts as an attempt only if it actually parses.
+    structure = ("<tool_call>" in text) or ("<|python_tag|>" in text)
+    return _call_from_name_obj(_first_json_object(text), "generic json", attempted=structure)
 
 
 # ---------------------------------------------------------------------------

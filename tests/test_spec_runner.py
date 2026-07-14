@@ -94,6 +94,18 @@ def test_run_tool_calling_native_abstention_with_broken_call_not_credited():
     assert result["aggregate"]["native_parse_failed"] == 1
 
 
+def test_run_tool_calling_native_unclosed_tag_on_abstention_not_credited():
+    cases = [ToolCase("t1", "write a haiku", [{"name": "get_weather"}], {"tool": None})]
+    calls = {"n": 0}
+    def gen(prompt):
+        calls["n"] += 1
+        return ('{"tool":null,"arguments":{}}' if calls["n"] == 1
+                else 'Haiku.\n<tool_call>\n{{"name":"send_email","arguments":{"to":"x"')
+    result = run_tool_calling(cases, FakeTokenizer(), gen, native=True)
+    assert result["aggregate"]["native"]["abstained_ok"] == 0.0
+    assert result["aggregate"]["native_parse_failed"] == 1
+
+
 def test_run_tool_calling_records_raw_output():
     cases = [ToolCase("t1", "weather?", [{"name": "get_weather"}],
                       {"tool": "get_weather", "arguments": {"location": "Paris"}})]
