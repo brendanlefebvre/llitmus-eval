@@ -405,3 +405,59 @@ def build_native_tool_prompt(tokenizer, case: "ToolCase") -> str:
 
 def build_constraint_prompt(tokenizer, case: "ConstraintCase") -> str:
     return _chat(tokenizer, [{"role": "user", "content": case.prompt}])
+
+
+# ---------------------------------------------------------------------------
+# runner
+# ---------------------------------------------------------------------------
+
+def run_constraints(cases: list, tokenizer, generate_fn) -> dict:
+    per_case_checks, records, errored = [], [], []
+    for case in cases:
+        prompt = build_constraint_prompt(tokenizer, case)
+        try:
+            text = generate_fn(prompt)
+        except Exception as e:  # noqa: BLE001 - report, don't crash the run
+            errored.append({"id": case.id, "error": str(e)})
+            continue
+        checks = score_constraint_case(text, case)
+        per_case_checks.append(checks)
+        records.append({"id": case.id, "checks": checks,
+                        "output_sample": text[:200]})
+    return {"aggregate": aggregate_constraints(per_case_checks),
+            "cases": records, "errored": errored}
+
+
+def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool) -> dict:
+    prompted_scores, native_scores, records, errored = [], [], [], []
+    native_parse_failed = 0
+    for case in cases:
+        rec = {"id": case.id, "prompted": None, "native": None}
+        try:
+            p_prompt = build_prompted_tool_prompt(tokenizer, case)
+            p_parsed = parse_prompted(generate_fn(p_prompt))
+            p_score = score_tool_call(p_parsed, case.expect)
+            prompted_scores.append(p_score)
+            rec["prompted"] = p_score
+            if native:
+                n_prompt = build_native_tool_prompt(tokenizer, case)
+                n_parsed = parse_native(generate_fn(n_prompt))
+                if not n_parsed.well_formed:
+                    native_parse_failed += 1
+                n_score = score_tool_call(n_parsed, case.expect)
+                native_scores.append(n_score)
+                rec["native"] = n_score
+        except Exception as e:  # noqa: BLE001
+            errored.append({"id": case.id, "error": str(e)})
+            continue
+        records.append(rec)
+    return {
+        "aggregate": {
+            "prompted": aggregate_tool(prompted_scores),
+            "native": aggregate_tool(native_scores) if native else None,
+            # distinct from well_formed=False and from abstention: how many
+            # native outputs the multi-format parser could not read at all.
+            "native_parse_failed": native_parse_failed if native else None,
+        },
+        "cases": records, "errored": errored,
+    }
