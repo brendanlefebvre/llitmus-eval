@@ -3,7 +3,6 @@ instruction/constraint-following capability evals.
 
 One case -> validate -> aggregate runner. Cases are JSONL data under cases/.
 No LLM judge, no reference model: every check is an objective parser.
-See docs/superpowers/specs/2026-07-13-spec-check-harness-design.md.
 """
 from __future__ import annotations
 
