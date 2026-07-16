@@ -136,7 +136,22 @@ class ToolCase:
 # constraint scoring
 # ---------------------------------------------------------------------------
 
-def score_constraint_case(text: str, case: "ConstraintCase") -> list:
+_NO_ANSWER = "no answer: thinking budget exhausted (unclosed <think>)"
+
+
+def score_constraint_case(text: str, case: "ConstraintCase",
+                          closed: bool = True) -> list:
+    """Score `text` against a case's checks.
+
+    `closed=False` means the model never finished reasoning, so there is no
+    answer. Those cases must fail explicitly rather than be scored on the empty
+    string: prohibition-style checks (all_lowercase, max_words, forbidden_word,
+    all_uppercase) are *vacuously satisfied* by empty text, which would reward a
+    runaway reasoner with a pass.
+    """
+    if not closed:
+        return [{"kind": kind, "passed": False, "detail": _NO_ANSWER}
+                for kind, _ in case.checks]
     out = []
     for kind, params in case.checks:
         res = CHECKS[kind].fn(text, params)
@@ -331,8 +346,17 @@ def parse_native(text: str) -> ParsedCall:
 # tool-call scoring
 # ---------------------------------------------------------------------------
 
-def score_tool_call(parsed: "ParsedCall", expect: dict, native: bool = False) -> dict:
+def score_tool_call(parsed: "ParsedCall", expect: dict, native: bool = False,
+                    closed: bool = True) -> dict:
     is_abstention = expect.get("tool") is None
+    if not closed:
+        # The model never finished reasoning, so there is no answer to score.
+        # This must bypass the native-abstention path below, which infers a
+        # deliberate no-call from the *absence* of tool-call structure — an
+        # empty answer has no structure either, and would be credited as a
+        # correct abstention for never having answered at all.
+        return {"well_formed": False, "right_tool": False, "args_ok": None,
+                "abstained_ok": False if is_abstention else None}
     abstained_ok = None
     args_ok = None
     if is_abstention:
@@ -374,6 +398,29 @@ def aggregate_tool(per_case: list) -> dict:
     return {d: _rate([c[d] for c in per_case]) for d in dims}
 
 
+def strip_thinking(text: str) -> tuple[str, bool]:
+    """Split a reasoning preamble off the front of `text`.
+
+    Returns (answer, closed). Only the explicit ``<think>…</think>`` tag is
+    honoured — unlike ``litmus.py``'s throughput-side counterpart, there is no
+    untagged prose-preamble heuristic here. That heuristic splits on the first
+    blank line, which is fine for estimating "useful t/s" but would silently
+    swallow half a legitimate answer during scoring (a ``min_words`` or
+    ``exact_bullets`` case would fail for the harness's reasons, not the
+    model's). Scoring gets the conservative path: no tag, no strip.
+
+    An opened ``<think>`` with no closing tag means the model burned its whole
+    budget reasoning and never committed to an answer. That returns ("", False)
+    so it scores as a miss — which is the honest result, not a harness artifact.
+    """
+    close_idx = text.find("</think>")
+    if close_idx != -1:
+        return text[close_idx + len("</think>"):].lstrip(), True
+    if text.lstrip().startswith("<think>"):
+        return "", False
+    return text, True
+
+
 # ---------------------------------------------------------------------------
 # elicitation
 # ---------------------------------------------------------------------------
@@ -387,18 +434,38 @@ _PROMPTED_SYSTEM = (
 )
 
 
-def _chat(tokenizer, messages, tools=None) -> str:
+def _chat(tokenizer, messages, tools=None, enable_thinking=None) -> str:
+    # Only forward enable_thinking when a mode was explicitly requested: older
+    # tokenizers predating thinking modes reject the unknown kwarg outright.
+    kw = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
     return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False, tools=tools)
+        messages, add_generation_prompt=True, tokenize=False, tools=tools, **kw)
 
 
-def build_prompted_tool_prompt(tokenizer, case: "ToolCase") -> str:
+def supports_thinking(tokenizer) -> bool:
+    """True when the chat template actually honours ``enable_thinking``.
+
+    Probes by rendering the same messages both ways and comparing, mirroring
+    `supports_native_tools`. A template that ignores the flag renders
+    identically and reports False, so non-thinking models keep a single column.
+    """
+    msgs = [{"role": "user", "content": "ping"}]
+    try:
+        default = _chat(tokenizer, msgs)
+        no_think = _chat(tokenizer, msgs, enable_thinking=False)
+    except Exception:
+        return False
+    return default != no_think
+
+
+def build_prompted_tool_prompt(tokenizer, case: "ToolCase",
+                               enable_thinking=None) -> str:
     schemas = json.dumps(case.tools, indent=2)
     system = _PROMPTED_SYSTEM.format(schemas=schemas)
     return _chat(tokenizer, [
         {"role": "system", "content": system},
         {"role": "user", "content": case.prompt},
-    ])
+    ], enable_thinking=enable_thinking)
 
 
 def supports_native_tools(tokenizer) -> bool:
@@ -413,65 +480,84 @@ def supports_native_tools(tokenizer) -> bool:
     return with_tools != without
 
 
-def build_native_tool_prompt(tokenizer, case: "ToolCase") -> str:
+def build_native_tool_prompt(tokenizer, case: "ToolCase",
+                             enable_thinking=None) -> str:
     return _chat(tokenizer, [{"role": "user", "content": case.prompt}],
-                 tools=case.tools)
+                 tools=case.tools, enable_thinking=enable_thinking)
 
 
-def build_constraint_prompt(tokenizer, case: "ConstraintCase") -> str:
-    return _chat(tokenizer, [{"role": "user", "content": case.prompt}])
+def build_constraint_prompt(tokenizer, case: "ConstraintCase",
+                            enable_thinking=None) -> str:
+    return _chat(tokenizer, [{"role": "user", "content": case.prompt}],
+                 enable_thinking=enable_thinking)
 
 
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 
-def run_constraints(cases: list, tokenizer, generate_fn) -> dict:
+def run_constraints(cases: list, tokenizer, generate_fn,
+                    enable_thinking=None) -> dict:
     per_case_checks, records, errored = [], [], []
     for case in cases:
-        prompt = build_constraint_prompt(tokenizer, case)
+        prompt = build_constraint_prompt(tokenizer, case,
+                                         enable_thinking=enable_thinking)
         try:
-            text = generate_fn(prompt)
+            raw = generate_fn(prompt)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
             continue
-        checks = score_constraint_case(text, case)
+        # Score the answer, not the scratchpad. A no-op for non-thinking models.
+        text, closed = strip_thinking(raw)
+        checks = score_constraint_case(text, case, closed=closed)
         per_case_checks.append(checks)
         records.append({"id": case.id, "checks": checks,
-                        "output_sample": text[:200]})
+                        "output_sample": text[:200],
+                        "thinking_unclosed": not closed})
     return {"aggregate": aggregate_constraints(per_case_checks),
             "cases": records, "errored": errored}
 
 
-def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool) -> dict:
+def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool,
+                     enable_thinking=None) -> dict:
     prompted_scores, native_scores, records, errored = [], [], [], []
     native_parse_failed = 0
     for case in cases:
         rec = {"id": case.id, "prompted": None, "native": None,
                "prompted_output": None, "native_output": None}
         try:
-            p_prompt = build_prompted_tool_prompt(tokenizer, case)
-            p_text = generate_fn(p_prompt)
-            p_score = score_tool_call(parse_prompted(p_text), case.expect)
+            p_prompt = build_prompted_tool_prompt(tokenizer, case,
+                                                  enable_thinking=enable_thinking)
+            # Score the answer, not the scratchpad: reasoning models weigh
+            # candidate calls as JSON inside <think>, and parse_prompted takes
+            # the first JSON object it finds. A no-op for non-thinking models.
+            p_text, p_closed = strip_thinking(generate_fn(p_prompt))
+            p_score = score_tool_call(parse_prompted(p_text), case.expect,
+                                      closed=p_closed)
             n_text = None
             n_score = None
             n_failed = False
+            n_closed = True
             if native:
-                n_prompt = build_native_tool_prompt(tokenizer, case)
-                n_text = generate_fn(n_prompt)
+                n_prompt = build_native_tool_prompt(tokenizer, case,
+                                                    enable_thinking=enable_thinking)
+                n_text, n_closed = strip_thinking(generate_fn(n_prompt))
                 n_parsed = parse_native(n_text)
                 n_failed = n_parsed.attempted and not n_parsed.well_formed
-                n_score = score_tool_call(n_parsed, case.expect, native=True)
+                n_score = score_tool_call(n_parsed, case.expect, native=True,
+                                          closed=n_closed)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
             continue
         prompted_scores.append(p_score)
         rec["prompted"] = p_score
         rec["prompted_output"] = p_text[:200]
+        rec["thinking_unclosed"] = not p_closed
         if native:
             native_scores.append(n_score)
             rec["native"] = n_score
             rec["native_output"] = n_text[:200]
+            rec["native_thinking_unclosed"] = not n_closed
             if n_failed:
                 native_parse_failed += 1
         records.append(rec)
@@ -524,8 +610,39 @@ def format_constraint_table(label: str, result: dict) -> str:
     return "\n".join(lines)
 
 
+def _headline(result: dict, profile: str) -> float:
+    """The one number a thinking/no-thinking comparison turns on."""
+    agg = result["aggregate"]
+    if profile == "constraints":
+        return agg["strict"] or 0.0
+    return (agg["prompted"] or {}).get("right_tool") or 0.0
+
+
+def format_thinking_gap(label: str, per_mode: dict, profile: str,
+                        tokens_per_case: dict) -> str:
+    """Report what thinking bought, and what it cost.
+
+    The delta alone is only half a routing decision: +0.08 accuracy for 18x the
+    tokens is a different call than +0.08 for free. Loxo needs both, so both go
+    on the line.
+    """
+    off, on = per_mode["no-think"], per_mode["think"]
+    gap = _headline(on, profile) - _headline(off, profile)
+    metric = "strict" if profile == "constraints" else "right_tool"
+    t_off = tokens_per_case.get("no-think") or 0.0
+    t_on = tokens_per_case.get("think") or 0.0
+    cost = f"{t_off:.0f} -> {t_on:.0f} tok/case"
+    if t_off > 0:
+        cost += f" ({t_on / t_off:.1f}x)"
+    return (f"{label}: thinking gap({metric})={gap:+.2f}  "
+            f"[no-think={_headline(off, profile):.2f}  "
+            f"think={_headline(on, profile):.2f}]  cost: {cost}")
+
+
 def write_sidecar(path: str, profile: str, model: str, label: str,
-                  convention_support: dict, result: dict) -> None:
+                  convention_support: dict, result: dict,
+                  modes: Optional[dict] = None,
+                  tokens_per_case: Optional[dict] = None) -> None:
     payload = {
         "profile": profile,
         "model": model,
@@ -537,6 +654,16 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
         "cases": result.get("cases", []),
         "errored": result.get("errored", []),
     }
+    # Top-level keys stay the primary (thinking, where supported) result so the
+    # sidecar contract holds; per-mode detail rides alongside for Loxo, which
+    # needs the accuracy/token trade-off to route.
+    if modes:
+        payload["modes"] = {
+            m: {"aggregate": r["aggregate"], "cases": r.get("cases", []),
+                "errored": r.get("errored", []),
+                "mean_tokens_per_case": (tokens_per_case or {}).get(m)}
+            for m, r in modes.items()
+        }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
@@ -553,6 +680,16 @@ DEFAULT_CASES = {
     "constraints": "cases/constraints.jsonl",
 }
 DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512}
+
+# Reasoning models need room for the scratchpad on top of the answer. Measured
+# on Ternary-Bonsai-27B-mlx-2bit (2026-07-15): the <think> preamble alone runs
+# 66-1084 tok across the tool-calling cases and 165-1445 across the constraint
+# cases. These ceilings clear 11/12 and 14/14 respectively. A case that still
+# overruns is a genuine non-termination, not a truncation artifact (tool-12
+# loops "I will output the JSON / One last check" past 8192), and scores as a
+# miss. max_tokens is a ceiling, not a target: non-thinking models stop at EOS
+# well short of it, so raising this does not perturb their scores.
+THINKING_MAX_TOKENS = {"tool-calling": 2048, "constraints": 1536}
 
 
 def _mlx_generate(model, tokenizer, prompt: str, max_tokens: int) -> str:
@@ -574,12 +711,18 @@ def main() -> None:
     ap.add_argument("--sizes", default="1.7B,4B,8B")
     ap.add_argument("--repo", default=None)
     ap.add_argument("--label", default=None)
-    ap.add_argument("--max-tokens", type=int, default=None)
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="ceiling for the non-thinking column")
+    ap.add_argument("--think-max-tokens", type=int, default=None,
+                    help="ceiling for the thinking column (needs room for the "
+                         "<think> scratchpad on top of the answer)")
     ap.add_argument("--out-dir", default=".")
     args = ap.parse_args()
 
     cases_path = args.cases or DEFAULT_CASES[args.profile]
     max_tokens = args.max_tokens or DEFAULT_MAX_TOKENS[args.profile]
+    think_max_tokens = (args.think_max_tokens
+                        or THINKING_MAX_TOKENS[args.profile])
     cases = load_cases(cases_path, args.profile)   # fail-fast before loading a model
     print(f"loaded {len(cases)} cases from {cases_path}")
 
@@ -587,21 +730,55 @@ def main() -> None:
         print(f"\n=== {label}: loading {repo} ===")
         model, tokenizer, t_load = _load_timed(repo)
         print(f"loaded in {t_load:.1f}s")
-        gen = lambda p: _mlx_generate(model, tokenizer, p, max_tokens)
 
-        if args.profile == "constraints":
-            result = run_constraints(cases, tokenizer, gen)
-            print(format_constraint_table(label, result))
-            conv = {"prompted": True, "native": False}
+        thinking = supports_thinking(tokenizer)
+        native = (args.profile == "tool-calling"
+                  and supports_native_tools(tokenizer))
+        conv = {"prompted": True, "native": native, "thinking": thinking}
+
+        # Thinking-capable models are scored both ways: the gap between them is
+        # what tells a router whether reasoning is worth its token cost for a
+        # task class. Models without a thinking mode keep their single column.
+        if thinking:
+            modes = [("no-think", False, max_tokens),
+                     ("think", True, think_max_tokens)]
         else:
-            native = supports_native_tools(tokenizer)
-            result = run_tool_calling(cases, tokenizer, gen, native=native)
-            print(format_tool_table(label, result))
-            conv = {"prompted": True, "native": native}
+            modes = [("default", None, max_tokens)]
+        print(f"thinking mode: {'supported' if thinking else 'not supported'}"
+              f" | native tools: {'yes' if native else 'no'}")
+
+        per_mode, tokens_per_case = {}, {}
+        for mode, flag, budget in modes:
+            tally = {"tokens": 0, "calls": 0}
+
+            def gen(p, _budget=budget, _tally=tally):
+                text = _mlx_generate(model, tokenizer, p, _budget)
+                _tally["tokens"] += len(tokenizer.encode(text))
+                _tally["calls"] += 1
+                return text
+
+            print(f"\n--- {label} [{mode}] (max_tokens={budget}) ---")
+            if args.profile == "constraints":
+                result = run_constraints(cases, tokenizer, gen,
+                                         enable_thinking=flag)
+                print(format_constraint_table(f"{label} [{mode}]", result))
+            else:
+                result = run_tool_calling(cases, tokenizer, gen, native=native,
+                                          enable_thinking=flag)
+                print(format_tool_table(f"{label} [{mode}]", result))
+            per_mode[mode] = result
+            tokens_per_case[mode] = (tally["tokens"] / tally["calls"]
+                                     if tally["calls"] else 0.0)
+
+        if thinking:
+            print("\n" + format_thinking_gap(label, per_mode, args.profile,
+                                             tokens_per_case))
+        primary = per_mode.get("think") or per_mode["default"]
 
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label)
         out_path = os.path.join(args.out_dir, f"results_{args.profile}_{safe}.json")
-        write_sidecar(out_path, args.profile, repo, label, conv, result)
+        write_sidecar(out_path, args.profile, repo, label, conv, primary,
+                      modes=per_mode, tokens_per_case=tokens_per_case)
         print(f"sidecar written: {out_path}")
 
         del model, tokenizer
