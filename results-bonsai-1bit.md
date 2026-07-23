@@ -991,3 +991,37 @@ resident** (cold-invoke-per-request re-pays the ~7 s load + ~0.5 s warmup each
 time). The conv-arch's theoretical long-context prefill advantage is plausible
 from the 1K curve but unproven — the extended-context prefill run (4K-32K) is the
 open item before any "conv beats attention at scale" claim.
+
+## Open items (reconciled 2026-07-23)
+
+Consolidated from a full read of this doc, reconciling every "planned / next /
+pending / carried to" line against the later dated addendums. Everything tied to
+the **GH200 evening session** is DONE despite earlier forward-references — the
+Gemma 4 MoE bf16 control (line 714), the "does the MoE fail distinctively at
+bf16?" question (726–728), and the MTP drafter speedups (756–768). The
+reasoning-tuning-tax-on-prose caution was replicated across families and retired.
+What genuinely remains:
+
+**Coding evaluation (under-covered):**
+- Coding runs never moved past snake + hanoi; the CLI-arg-parsing / Flask-handler
+  task types called for at line 522 were never run.
+- Nemotron 3 Nano coding one-shots — promised as the fair next test (668–671) and
+  as the gate on its specialist slots (687–688), never run.
+- Mac-runtime confirmation of the Qwen3.5-122B one-shot code — later passes were
+  static review only (784–785).
+
+**Format / throughput studies (budget-truncated):**
+- NVFP4 batched-throughput fair test + the bf16 leg of the 122B shootout — cut for
+  budget, logged as a gap (846–847). B300/NVFP4 phase is author-labeled "partial."
+
+**LFM2.5 (newest arch, two unresolved gates):**
+- Extended-context 4K-32K prefill run — the explicit gate before any "conv beats
+  attention at scale" claim; harness still caps at 1000 tokens (977–982, 991–993).
+- Raw-input perplexity anomaly (87.0) — model property vs. mlx-lm `lfm2` new-arch
+  immaturity, untested (958–959).
+
+**Housekeeping:**
+- Gemma QAT-trained Q4 in MLX format — "if/when available" (524); depends on a
+  conversion that hasn't appeared.
+- nemotron_h cross-backend perplexity footnote / upstream issue — flagged but never
+  filed (751–752).
