@@ -95,3 +95,19 @@ def test_bool_for_int_param_raises(tmp_path):
                  '{"id":"a","prompt":"p","checks":[{"kind":"exact_bullets","n":true}]}')
     with pytest.raises(CaseError, match="n"):
         load_cases(path, "constraints")
+
+
+def test_invalid_regex_pattern_raises_at_load(tmp_path):
+    # A bad regex must fail fast during loading, not crash mid-run after the
+    # model is loaded (score_constraint_case runs outside run_constraints' guard).
+    path = write(tmp_path, "c.jsonl",
+                 '{"id":"a","prompt":"p","checks":[{"kind":"regex_match","pattern":"([unclosed"}]}')
+    with pytest.raises(CaseError, match="line 1.*regex_match.*pattern"):
+        load_cases(path, "constraints")
+
+
+def test_valid_regex_pattern_loads(tmp_path):
+    path = write(tmp_path, "c.jsonl",
+                 '{"id":"a","prompt":"p","checks":[{"kind":"regex_match","pattern":"^ok$"}]}')
+    cases = load_cases(path, "constraints")
+    assert cases[0].checks == [("regex_match", {"pattern": "^ok$"})]

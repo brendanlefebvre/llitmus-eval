@@ -213,6 +213,13 @@ def _load_constraint_line(obj: dict, ln: int) -> "ConstraintCase":
                 raise CaseError(
                     f"line {ln}: check '{kind}' param '{pname}' must be "
                     f"{ptype.__name__}, got {type(val).__name__}")
+            if kind == "regex_match" and pname == "pattern":
+                try:
+                    re.compile(val)
+                except re.error as e:
+                    raise CaseError(
+                        f"line {ln}: check 'regex_match' param 'pattern' "
+                        f"is not a valid regex: {e}")
             params[pname] = val
         checks.append((kind, params))
     return ConstraintCase(id=cid, prompt=prompt, checks=checks)

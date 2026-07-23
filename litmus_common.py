@@ -13,9 +13,11 @@ warnings.filterwarnings(
     message=r".*mx\.metal\.(clear_cache|get_peak_memory|reset_peak_memory).*deprecated.*",
 )
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx_lm import load, stream_generate
+# MLX is imported lazily (see _mlx() and __getattr__ below) so litmus_common's
+# pure helpers — model tables, size parsing, target resolution — import on any
+# platform, not just Apple Silicon. Only the model-running re-exports (mx, nn,
+# load, stream_generate) and the memory helpers touch MLX; they resolve it on
+# first use and let ImportError propagate to callers that genuinely need it.
 
 MODELS = {
     "1.7B": "prism-ml/Bonsai-1.7B-mlx-1bit",
@@ -41,6 +43,38 @@ WARMUP_PROMPT = "Hello."
 
 
 # ---------------------------------------------------------------------------
+# lazy MLX access
+# ---------------------------------------------------------------------------
+
+_MLX: dict = {}  # cache: name -> imported MLX object
+
+
+def _mlx() -> dict:
+    """Import MLX on first use and cache the names we re-export.
+
+    ImportError is left to propagate: any caller reaching here is on a
+    model-running path and genuinely needs MLX installed.
+    """
+    if not _MLX:
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx_lm import load, stream_generate
+        _MLX.update(mx=mx, nn=nn, load=load, stream_generate=stream_generate)
+    return _MLX
+
+
+_LAZY_NAMES = ("mx", "nn", "load", "stream_generate")
+
+
+def __getattr__(name: str):
+    # PEP 562: resolve the MLX-backed re-exports lazily so importers can still
+    # do `from litmus_common import stream_generate` without eager-loading MLX.
+    if name in _LAZY_NAMES:
+        return _mlx()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# ---------------------------------------------------------------------------
 # shared helpers
 # ---------------------------------------------------------------------------
 
@@ -51,6 +85,7 @@ def _resp_text(resp) -> str:
 
 def _peak_memory_mb() -> float:
     # mx.metal.get_peak_memory is deprecated; prefer top-level mx.get_peak_memory.
+    mx = _mlx()["mx"]
     if hasattr(mx, "get_peak_memory"):
         return mx.get_peak_memory() / (1024 * 1024)
     if hasattr(mx, "metal") and hasattr(mx.metal, "get_peak_memory"):
@@ -59,6 +94,7 @@ def _peak_memory_mb() -> float:
 
 
 def _reset_peak_memory() -> None:
+    mx = _mlx()["mx"]
     if hasattr(mx, "reset_peak_memory"):
         mx.reset_peak_memory()
         return
@@ -67,6 +103,7 @@ def _reset_peak_memory() -> None:
 
 
 def _clear_cache() -> None:
+    mx = _mlx()["mx"]
     if hasattr(mx, "clear_cache"):
         mx.clear_cache()
         return
@@ -96,6 +133,7 @@ def _targets_for(args) -> list[tuple[str, str]]:
 
 
 def _load_timed(repo: str) -> tuple[object, object, float]:
+    load = _mlx()["load"]
     t0 = time.perf_counter()
     model, tokenizer = load(repo)
     return model, tokenizer, time.perf_counter() - t0
