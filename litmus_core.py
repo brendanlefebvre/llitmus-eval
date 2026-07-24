@@ -8,6 +8,7 @@ reached only through a Backend (see litmus_common.get_backend).
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -104,6 +105,22 @@ def distinct_trigram_ratio(tokens: list[int]) -> float:
         return float("nan")
     trigrams = [tuple(tokens[i:i + 3]) for i in range(len(tokens) - 2)]
     return len(set(trigrams)) / len(trigrams)
+
+
+def compute_perplexity(backend, model, tokenizer, text: str,
+                       window: int) -> float:
+    """Teacher-forced perplexity over the first `window` tokens of `text`.
+
+    Returns exp(mean NLL); lower is better. The core owns tokenization,
+    windowing, and aggregation; the backend owns the forward pass via
+    token_logprobs.
+    """
+    ids = tokenizer.encode(text)[:window]
+    if len(ids) < 2:
+        return float("nan")
+    logprobs = backend.token_logprobs(model, tokenizer, ids)
+    mean_nll = -sum(logprobs) / len(logprobs)
+    return math.exp(mean_nll)
 
 
 @dataclass
