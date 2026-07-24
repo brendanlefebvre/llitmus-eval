@@ -1,24 +1,14 @@
-"""Shared core for Litmus: model tables, loading, and MLX memory helpers.
+"""Shared core for Litmus: model tables, size parsing, target resolution,
+and the Backend protocol.
 
 Imported by litmus.py (perf benchmarks) and litmus_spec.py (spec-check harness)
-so the two share one loading/targeting path instead of drifting copies.
+so the two share one loading/targeting path instead of drifting copies. MLX
+helpers live in litmus_mlx.py; the lazy shims below exist only until Phase D
+retires litmus_spec.py's direct MLX imports.
 """
 from __future__ import annotations
 
-import time
-import warnings
 from typing import Iterator, Protocol, runtime_checkable
-
-warnings.filterwarnings(
-    "ignore",
-    message=r".*mx\.metal\.(clear_cache|get_peak_memory|reset_peak_memory).*deprecated.*",
-)
-
-# MLX is imported lazily (see _mlx() and __getattr__ below) so litmus_common's
-# pure helpers — model tables, size parsing, target resolution — import on any
-# platform, not just Apple Silicon. Only the model-running re-exports (mx, nn,
-# load, stream_generate) and the memory helpers touch MLX; they resolve it on
-# first use and let ImportError propagate to callers that genuinely need it.
 
 MODELS = {
     "1.7B": "prism-ml/Bonsai-1.7B-mlx-1bit",
@@ -91,75 +81,6 @@ def get_backend(name: str = "auto") -> "Backend":
     raise SystemExit(f"unknown backend {name!r}; pick from mlx | cuda | auto")
 
 
-# ---------------------------------------------------------------------------
-# lazy MLX access
-# ---------------------------------------------------------------------------
-
-_MLX: dict = {}  # cache: name -> imported MLX object
-
-
-def _mlx() -> dict:
-    """Import MLX on first use and cache the names we re-export.
-
-    ImportError is left to propagate: any caller reaching here is on a
-    model-running path and genuinely needs MLX installed.
-    """
-    if not _MLX:
-        import mlx.core as mx
-        import mlx.nn as nn
-        from mlx_lm import load, stream_generate
-        _MLX.update(mx=mx, nn=nn, load=load, stream_generate=stream_generate)
-    return _MLX
-
-
-_LAZY_NAMES = ("mx", "nn", "load", "stream_generate")
-
-
-def __getattr__(name: str):
-    # PEP 562: resolve the MLX-backed re-exports lazily so importers can still
-    # do `from litmus_common import stream_generate` without eager-loading MLX.
-    if name in _LAZY_NAMES:
-        return _mlx()[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-# ---------------------------------------------------------------------------
-# shared helpers
-# ---------------------------------------------------------------------------
-
-def _resp_text(resp) -> str:
-    """stream_generate yields GenerationResponse in newer mlx_lm, str in older."""
-    return resp.text if hasattr(resp, "text") else str(resp)
-
-
-def _peak_memory_mb() -> float:
-    # mx.metal.get_peak_memory is deprecated; prefer top-level mx.get_peak_memory.
-    mx = _mlx()["mx"]
-    if hasattr(mx, "get_peak_memory"):
-        return mx.get_peak_memory() / (1024 * 1024)
-    if hasattr(mx, "metal") and hasattr(mx.metal, "get_peak_memory"):
-        return mx.metal.get_peak_memory() / (1024 * 1024)
-    return 0.0
-
-
-def _reset_peak_memory() -> None:
-    mx = _mlx()["mx"]
-    if hasattr(mx, "reset_peak_memory"):
-        mx.reset_peak_memory()
-        return
-    if hasattr(mx, "metal") and hasattr(mx.metal, "reset_peak_memory"):
-        mx.metal.reset_peak_memory()
-
-
-def _clear_cache() -> None:
-    mx = _mlx()["mx"]
-    if hasattr(mx, "clear_cache"):
-        mx.clear_cache()
-        return
-    if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
-        mx.metal.clear_cache()
-
-
 def _parse_sizes(sizes_str: str) -> list[str]:
     selected = [s.strip() for s in sizes_str.split(",") if s.strip()]
     unknown = [s for s in selected if s not in MODELS]
@@ -181,8 +102,25 @@ def _targets_for(args) -> list[tuple[str, str]]:
     return [(size, MODELS[size]) for size in _parse_sizes(args.sizes)]
 
 
+# ---------------------------------------------------------------------------
+# temporary lazy shims for litmus_spec.py (removed in Phase D / Task 10)
+# ---------------------------------------------------------------------------
+
+def stream_generate(*args, **kwargs):
+    from mlx_lm import stream_generate as _impl
+    return _impl(*args, **kwargs)
+
+
+def _resp_text(resp) -> str:
+    from litmus_mlx import _resp_text as _impl
+    return _impl(resp)
+
+
+def _clear_cache() -> None:
+    from litmus_mlx import MLXBackend
+    MLXBackend().clear_cache()
+
+
 def _load_timed(repo: str) -> tuple[object, object, float]:
-    load = _mlx()["load"]
-    t0 = time.perf_counter()
-    model, tokenizer = load(repo)
-    return model, tokenizer, time.perf_counter() - t0
+    from litmus_mlx import MLXBackend
+    return MLXBackend().load(repo)
