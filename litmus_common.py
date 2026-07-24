@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 import warnings
+from typing import Iterator, Protocol, runtime_checkable
 
 warnings.filterwarnings(
     "ignore",
@@ -40,6 +41,54 @@ PROMPTS = [
 ]
 
 WARMUP_PROMPT = "Hello."
+
+
+@runtime_checkable
+class Backend(Protocol):
+    """The single model-runtime seam for Litmus.
+
+    The core owns every algorithm; a backend owns only the library-specific
+    parts: loading, token generation, one forward pass for log-probs, and
+    memory telemetry.
+    """
+    name: str
+
+    def load(self, repo: str, **opts) -> tuple[object, object, float]:
+        """Return (model, tokenizer, load_seconds)."""
+
+    def stream(self, model, tokenizer, prompt: str,
+               max_tokens: int) -> Iterator[str]:
+        """Yield one generated token's text per step."""
+
+    def token_logprobs(self, model, tokenizer, ids: list[int]) -> list[float]:
+        """Per-token log-probs as floats: logprob of ids[i] given ids[:i],
+        for i in 1..len(ids)-1. Returns len(ids)-1 values."""
+
+    def peak_memory_mb(self) -> float: ...
+    def reset_peak_memory(self) -> None: ...
+    def clear_cache(self) -> None: ...
+
+
+def get_backend(name: str = "auto") -> "Backend":
+    """Resolve a backend by name: 'mlx' | 'cuda' | 'auto'.
+
+    'auto' picks MLX if importable, else torch. Imports only the selected
+    backend's module, so importing litmus_common/litmus_core pulls in neither
+    mlx nor torch.
+    """
+    if name == "auto":
+        try:
+            import mlx.core  # noqa: F401
+            name = "mlx"
+        except ImportError:
+            name = "cuda"
+    if name == "mlx":
+        from litmus_mlx import MLXBackend
+        return MLXBackend()
+    if name == "cuda":
+        from litmus_torch import TorchBackend
+        return TorchBackend()
+    raise SystemExit(f"unknown backend {name!r}; pick from mlx | cuda | auto")
 
 
 # ---------------------------------------------------------------------------
