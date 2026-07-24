@@ -1,0 +1,14 @@
+{"id":"constr-01","prompt":"List exactly three primary colors, one per line as a bulleted list, all lowercase.","checks":[{"kind":"exact_bullets","n":3},{"kind":"all_lowercase"}]}
+{"id":"constr-02","prompt":"Reply with a single JSON object mapping the keys name and age to example values. Output only the JSON.","checks":[{"kind":"valid_json"}]}
+{"id":"constr-03","prompt":"Write two sentences about the ocean. Do not use the word water.","checks":[{"kind":"forbidden_word","word":"water"},{"kind":"max_words","n":60}]}
+{"id":"constr-04","prompt":"Write a short paragraph of at least 40 words explaining why public libraries matter.","checks":[{"kind":"min_words","n":40}]}
+{"id":"constr-05","prompt":"Respond with a short motivational shout in ALL CAPITAL LETTERS, no more than 10 words. Example style: NEVER GIVE UP.","checks":[{"kind":"all_uppercase"},{"kind":"max_words","n":10}]}
+{"id":"constr-06","prompt":"Explain what photosynthesis is in one short paragraph. Your answer must include the exact phrase 'chlorophyll and sunlight' somewhere.","checks":[{"kind":"required_phrase","phrase":"chlorophyll and sunlight"}]}
+{"id":"constr-07","prompt":"Give a one-sentence recommendation for a good pizza topping. End your response with the exact phrase 'you won't regret it'.","checks":[{"kind":"ends_with","phrase":"you won't regret it"}]}
+{"id":"constr-08","prompt":"List exactly three fruits as a numbered list, one fruit per line, in the form '1. fruit'.","checks":[{"kind":"exact_bullets","n":3},{"kind":"regex_match","pattern":"(?m)^\\d+\\.\\s+\\S"}]}
+{"id":"constr-09","prompt":"Write a short haiku about rain, all lowercase, and make the last line exactly 'the quiet rain'.","checks":[{"kind":"all_lowercase"},{"kind":"ends_with","phrase":"the quiet rain"}]}
+{"id":"constr-10","prompt":"Write two sentences about the future of transportation. Do not use the word gasoline, and make sure to include the exact phrase 'electric vehicles'.","checks":[{"kind":"forbidden_word","word":"gasoline"},{"kind":"required_phrase","phrase":"electric vehicles"}]}
+{"id":"constr-11","prompt":"Write a paragraph about your favorite way to drink coffee, between 20 and 50 words long.","checks":[{"kind":"min_words","n":20},{"kind":"max_words","n":50}]}
+{"id":"constr-12","prompt":"Reply with a single JSON object that has a key 'status' with the value 'ok'. Output only the JSON.","checks":[{"kind":"valid_json"},{"kind":"regex_match","pattern":"\"status\"\\s*:\\s*\"ok\""}]}
+{"id":"constr-13","prompt":"Reply with the single word CONFIRMED in all capital letters, and nothing else.","checks":[{"kind":"all_uppercase"},{"kind":"regex_match","pattern":"^CONFIRMED\\s*$"}]}
+{"id":"constr-14","prompt":"Name exactly five programming languages as a bulleted list, one per line, all lowercase.","checks":[{"kind":"exact_bullets","n":5},{"kind":"all_lowercase"}]}

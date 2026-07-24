@@ -5,3 +5,5 @@ reference.txt
 .venv*/
 __pycache__/
 *.pyc
+# spec-check run artifacts (per-run sidecars written by litmus_spec.py)
+results_*.json
