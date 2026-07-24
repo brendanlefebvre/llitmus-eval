@@ -8,11 +8,18 @@ reached only through a Backend (see litmus_common.get_backend).
 """
 from __future__ import annotations
 
+import gc
 import math
 import os
 import re
+import tempfile
+import time
 from dataclasses import dataclass
 from typing import Optional
+
+from litmus_common import (
+    BASELINE_MODELS, PROMPTS, WARMUP_PROMPT, _targets_for,
+)
 
 REFERENCE_TEXT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "reference.txt"
@@ -194,3 +201,384 @@ def print_table(all_runs: list[Run]) -> None:
     print("\n--- Sample outputs (first 80 chars) ---")
     for r in all_runs:
         print(f"  [{r.label}] {r.prompt[:30]:<30} -> {r.sample}")
+
+
+# ---------------------------------------------------------------------------
+# cmd: throughput
+# ---------------------------------------------------------------------------
+
+def run_one(
+    backend,
+    model,
+    tokenizer,
+    prompt: str,
+    max_tokens: int,
+    label: str,
+    strip_thinking: bool = False,
+) -> Run:
+    backend.reset_peak_memory()
+
+    n_prompt = len(tokenizer.encode(prompt))
+    t_start = time.perf_counter()
+    first_token_t: Optional[float] = None
+    chunks: list[str] = []
+    gen_tokens = 0
+
+    for resp in backend.stream(model, tokenizer, prompt, max_tokens):
+        if first_token_t is None:
+            first_token_t = time.perf_counter()
+        chunks.append(resp)
+        gen_tokens += 1
+
+    t_end = time.perf_counter()
+    if first_token_t is None:
+        first_token_t = t_end
+
+    prefill_s = first_token_t - t_start
+    decode_s = max(t_end - first_token_t, 1e-9)
+    full_text = "".join(chunks)
+
+    useful_gen: Optional[int] = None
+    useful_tps: Optional[float] = None
+    if strip_thinking:
+        _, scratchpad_tokens = _strip_thinking(full_text, tokenizer)
+        useful_gen = max(gen_tokens - scratchpad_tokens, 0)
+        useful_tps = useful_gen / decode_s
+
+    return Run(
+        label=label,
+        prompt=prompt[:40],
+        prompt_tokens=n_prompt,
+        gen_tokens=gen_tokens,
+        prefill_tps=(n_prompt / prefill_s) if prefill_s > 0 else 0.0,
+        decode_tps=gen_tokens / decode_s,
+        ttft_ms=prefill_s * 1000.0,
+        peak_mem_mb=backend.peak_memory_mb(),
+        sample=full_text[:80].replace("\n", " "),
+        useful_gen_tokens=useful_gen,
+        useful_decode_tps=useful_tps,
+    )
+
+
+def bench_model(
+    backend, label: str, repo: str, max_tokens: int, strip_thinking: bool
+) -> list[Run]:
+    print(f"\n=== {label}: loading {repo} ===")
+    model, tokenizer, t_load = backend.load(repo)
+    print(f"loaded in {t_load:.1f}s")
+
+    # Warmup pass — discard. First call pays kernel-compile + cache costs.
+    print("warmup...")
+    for _ in backend.stream(model, tokenizer, WARMUP_PROMPT, 8):
+        pass
+
+    runs: list[Run] = []
+    for prompt in PROMPTS:
+        r = run_one(backend, model, tokenizer, prompt, max_tokens, label,
+                    strip_thinking)
+        runs.append(r)
+        extra = ""
+        if r.useful_decode_tps is not None:
+            extra = f"  useful {r.useful_decode_tps:>6.1f} t/s"
+        print(
+            f"  {prompt[:36]:<36} {r.decode_tps:>6.1f} tok/s "
+            f"prefill {r.prefill_tps:>6.1f} t/s  TTFT {r.ttft_ms:>6.1f} ms  "
+            f"peak {r.peak_mem_mb:>6.0f} MB{extra}"
+        )
+
+    del model, tokenizer
+    gc.collect()
+    backend.clear_cache()
+    return runs
+
+
+def cmd_throughput(backend, args) -> None:
+    all_runs: list[Run] = []
+    for label, repo in _targets_for(args):
+        all_runs.extend(
+            bench_model(backend, label, repo, args.max_tokens, args.strip_thinking)
+        )
+    print_table(all_runs)
+
+
+# ---------------------------------------------------------------------------
+# cmd: perplexity
+# ---------------------------------------------------------------------------
+
+def cmd_perplexity(backend, args) -> None:
+    text = _load_reference_text(args.reference_text)
+    print(f"loaded reference text: {len(text)} chars")
+    print(f"perplexity window: {args.ppl_window} tokens\n")
+
+    results: list[tuple[str, float]] = []
+    for label, repo in _targets_for(args):
+        print(f"=== {label}: loading {repo} ===")
+        model, tokenizer, t_load = backend.load(repo)
+        print(f"loaded in {t_load:.1f}s")
+        ppl = compute_perplexity(backend, model, tokenizer, text, args.ppl_window)
+        print(f"  perplexity: {ppl:.3f}\n")
+        results.append((label, ppl))
+        del model, tokenizer
+        gc.collect()
+        backend.clear_cache()
+
+    print("--- Perplexity summary (lower is better) ---")
+    print(f"{'label':<32} {'perplexity':>12}")
+    for label, ppl in results:
+        print(f"{label:<32} {ppl:>12.3f}")
+
+
+# ---------------------------------------------------------------------------
+# cmd: prefill-scaling
+# ---------------------------------------------------------------------------
+
+def cmd_prefill_scaling(backend, args) -> None:
+    lengths = [10, 50, 200, 500, 1000]
+    ref = _load_reference_text(args.reference_text)
+
+    for label, repo in _targets_for(args):
+        print(f"\n=== {label}: prefill scaling ===")
+        model, tokenizer, t_load = backend.load(repo)
+        print(f"loaded in {t_load:.1f}s")
+
+        for _ in backend.stream(model, tokenizer, WARMUP_PROMPT, 4):
+            pass
+
+        ref_ids = tokenizer.encode(ref)
+        if len(ref_ids) < max(lengths):
+            raise SystemExit(
+                f"reference text has only {len(ref_ids)} tokens, need "
+                f"{max(lengths)}. Download the full Gutenberg text."
+            )
+
+        print(f"  {'n_tokens':>10} {'prefill t/s':>14} {'TTFT ms':>12}")
+        for n in lengths:
+            ids = ref_ids[:n]
+            prompt = tokenizer.decode(ids)
+            # Re-encode to get the actual token count after decode round-trip.
+            actual_n = len(tokenizer.encode(prompt))
+            t0 = time.perf_counter()
+            first = None
+            for _ in backend.stream(model, tokenizer, prompt, 1):
+                if first is None:
+                    first = time.perf_counter()
+                    break
+            if first is None:
+                first = time.perf_counter()
+            prefill_s = max(first - t0, 1e-9)
+            print(
+                f"  {actual_n:>10} {actual_n / prefill_s:>14.1f} "
+                f"{prefill_s * 1000:>12.1f}"
+            )
+
+        del model, tokenizer
+        gc.collect()
+        backend.clear_cache()
+
+
+# ---------------------------------------------------------------------------
+# cmd: decode-stability
+# ---------------------------------------------------------------------------
+
+def cmd_decode_stability(backend, args) -> None:
+    window = 128
+    total = args.max_tokens if args.max_tokens >= window else 1024
+    if args.max_tokens < window:
+        print(f"(bumping max-tokens to {total} so windows fit)")
+
+    prompt = (
+        "Write a long, detailed essay about the history of the telescope, "
+        "covering its invention, major improvements, and scientific impact."
+    )
+
+    for label, repo in _targets_for(args):
+        mode = "chat" if args.chat else "raw"
+        print(f"\n=== {label}: decode stability over {total} tokens ({mode}) ===")
+        model, tokenizer, t_load = backend.load(repo)
+        print(f"loaded in {t_load:.1f}s")
+        backend.reset_peak_memory()
+
+        # Optionally wrap the prompt in the model's chat template. Without this
+        # an instruct-tuned model continues the prompt as text rather than
+        # responding to it.
+        if args.chat:
+            try:
+                actual_prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception as e:
+                print(f"  WARNING: chat template failed ({e}); using raw prompt")
+                actual_prompt = prompt
+        else:
+            actual_prompt = prompt
+
+        for _ in backend.stream(model, tokenizer, WARMUP_PROMPT, 4):
+            pass
+
+        per_window_tps: list[float] = []
+        per_window_mem: list[float] = []
+        chunks: list[str] = []
+        gen = 0
+        t_prev = None
+        t_first = None
+
+        for resp in backend.stream(model, tokenizer, actual_prompt, total):
+            if t_prev is None:
+                t_prev = time.perf_counter()
+                t_first = t_prev
+            chunks.append(resp)
+            gen += 1
+            if gen % window == 0:
+                t_now = time.perf_counter()
+                per_window_tps.append(window / max(t_now - t_prev, 1e-9))
+                per_window_mem.append(backend.peak_memory_mb())
+                t_prev = t_now
+        t_last = time.perf_counter()
+
+        full_text = "".join(chunks)
+        tokens = tokenizer.encode(full_text)
+        distinct = distinct_trigram_ratio(tokens)
+
+        print(f"  windows: {len(per_window_tps)} x {window} tokens each")
+        print(
+            "  window tok/s: "
+            + " ".join(f"{t:6.1f}" for t in per_window_tps)
+        )
+        print(
+            "  peak MB:      "
+            + " ".join(f"{m:6.0f}" for m in per_window_mem)
+        )
+        if per_window_tps:
+            first, last = per_window_tps[0], per_window_tps[-1]
+            pct = (last - first) / first * 100 if first > 0 else 0
+            direction = "slowdown" if pct < 0 else "speedup"
+            print(f"  first->last tok/s: {pct:+.1f}% ({direction})")
+        print(f"  distinct-trigram ratio: {distinct:.3f} (1.0 = no repetition)")
+
+        if args.strip_thinking:
+            useful_text, scratch_tokens = _strip_thinking(full_text, tokenizer)
+            useful_tokens = len(tokenizer.encode(useful_text)) if useful_text else 0
+            elapsed = (t_last - t_first) if t_first is not None else float("nan")
+            useful_tps = useful_tokens / max(elapsed, 1e-9)
+            useful_pct = (useful_tokens / gen * 100) if gen else 0.0
+            print(
+                f"  strip-thinking: {scratch_tokens} scratchpad tok, "
+                f"{useful_tokens} useful tok ({useful_pct:.0f}% useful)"
+            )
+            print(
+                f"  useful tok/s: {useful_tps:.1f} "
+                "(answer tokens / decode time, excludes reasoning)"
+            )
+
+        # Dump full generated text and show head/tail inline. Critical when
+        # the trigram ratio collapses — without seeing the actual loop content,
+        # you can't tell whether the model is repeating prose or stuck on a
+        # single token.
+        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)
+        out_path = os.path.join(
+            tempfile.gettempdir(), f"decode_stability_{safe_label}.txt"
+        )
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(full_text)
+        head = full_text[:300].replace("\n", " ⏎ ")
+        tail = full_text[-300:].replace("\n", " ⏎ ")
+        print(f"  full output saved: {out_path} ({len(full_text)} chars)")
+        print(f"  head: {head}")
+        print(f"  tail: {tail}")
+
+        del model, tokenizer
+        gc.collect()
+        backend.clear_cache()
+
+
+# ---------------------------------------------------------------------------
+# cmd: baseline
+# ---------------------------------------------------------------------------
+
+def cmd_baseline(backend, args) -> None:
+    """Run stock 4-bit Llama 3.2 1B & 3B through throughput + perplexity."""
+    try:
+        ref = _load_reference_text(args.reference_text)
+    except SystemExit as e:
+        print(f"(skipping perplexity: {e})")
+        ref = None
+
+    all_runs: list[Run] = []
+    ppls: list[tuple[str, float]] = []
+
+    for name, repo in BASELINE_MODELS.items():
+        print(f"\n=== {name}: loading {repo} ===")
+        model, tokenizer, t_load = backend.load(repo)
+        print(f"loaded in {t_load:.1f}s")
+
+        for _ in backend.stream(model, tokenizer, WARMUP_PROMPT, 8):
+            pass
+
+        for prompt in PROMPTS:
+            r = run_one(backend, model, tokenizer, prompt, args.max_tokens,
+                        name, False)
+            all_runs.append(r)
+            print(
+                f"  {prompt[:36]:<36} {r.decode_tps:>6.1f} tok/s "
+                f"prefill {r.prefill_tps:>6.1f} t/s  peak {r.peak_mem_mb:>6.0f} MB"
+            )
+
+        if ref is not None:
+            ppl = compute_perplexity(backend, model, tokenizer, ref,
+                                     args.ppl_window)
+            print(f"  perplexity: {ppl:.3f}")
+            ppls.append((name, ppl))
+
+        del model, tokenizer
+        gc.collect()
+        backend.clear_cache()
+
+    print_table(all_runs)
+    if ppls:
+        print("\n--- Baseline perplexity ---")
+        for name, ppl in ppls:
+            print(f"  {name:<20} {ppl:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# cmd: cold-start
+# ---------------------------------------------------------------------------
+
+def _single_ttft(backend, model, tokenizer, prompt: str) -> float:
+    t0 = time.perf_counter()
+    for _ in backend.stream(model, tokenizer, prompt, 1):
+        return time.perf_counter() - t0
+    return time.perf_counter() - t0
+
+
+def cmd_cold_start(backend, args) -> None:
+    print(f"{'label':<24} {'load s':>10} {'cold TTFT ms':>14} "
+          f"{'warm TTFT ms':>14} {'delta ms':>12}")
+    for label, repo in _targets_for(args):
+        model, tokenizer, t_load = backend.load(repo)
+        cold_ttft = _single_ttft(backend, model, tokenizer, WARMUP_PROMPT)
+        warm_ttft = _single_ttft(backend, model, tokenizer, WARMUP_PROMPT)
+        delta = (cold_ttft - warm_ttft) * 1000
+        print(
+            f"{label:<24} {t_load:>10.2f} {cold_ttft * 1000:>14.1f} "
+            f"{warm_ttft * 1000:>14.1f} {delta:>12.1f}"
+        )
+        del model, tokenizer
+        gc.collect()
+        backend.clear_cache()
+
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+COMMANDS = {
+    "throughput": cmd_throughput,
+    "perplexity": cmd_perplexity,
+    "prefill-scaling": cmd_prefill_scaling,
+    "decode-stability": cmd_decode_stability,
+    "baseline": cmd_baseline,
+    "cold-start": cmd_cold_start,
+}
