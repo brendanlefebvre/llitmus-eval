@@ -1,7 +1,7 @@
 # Decoupling Litmus from MLX: a shared core + pluggable backends
 
-**Status:** Design approved, pending spec review
-**Branch:** `refactor/decouple-mlx-backend`
+**Status:** Design + spec approved; implementation plan written
+**Branch:** `refactor/decouple-mlx-backend` (stacked on `main`; PR #1 merged 2026-07-24)
 **Date:** 2026-07-24
 
 ## Motivation
@@ -223,6 +223,17 @@ Each phase keeps the full suite green. CI is deferred (would be a later Phase F)
   repos; the command logic is backend-agnostic but the default model list is
   MLX-flavored. The plan decides whether `baseline`'s defaults are
   backend-parameterized or left MLX-default with `--repo` override.
-- **PR #1 interaction.** This branch is stacked on `feat/spec-check-harness`
-  (PR #1, unmerged). The `_mlx()` lazy shim from PR #1 is superseded here; retire
-  it cleanly to avoid two lazy-import mechanisms coexisting.
+- **PR #1 interaction.** PR #1 (`feat/spec-check-harness`) is now merged to
+  `main`; this branch was rebased onto the squash-merge. The `_mlx()` lazy shim
+  from PR #1 is superseded here; retire it cleanly to avoid two lazy-import
+  mechanisms coexisting.
+- **`assisted` command (torch-only).** `litmus_cuda.py` carries an `assisted`
+  speculative-decoding command (`model.generate(assistant_model=...)`) with no
+  MLX equivalent — it cannot ride the `Backend` protocol. Decision: it stays a
+  torch-native command in the shim, outside the protocol; the core stays
+  backend-agnostic.
+- **Torch console output format.** Routing the torch throughput/decode-stability
+  commands through the core's shared `print_table` changes the torch CLI's
+  console layout to match `litmus.py`'s (numbers identical). Accepted — the
+  duplication kill is the point; `results-bonsai-1bit.md` is static and
+  unaffected.
