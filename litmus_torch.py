@@ -6,8 +6,11 @@ equivalent and therefore lives outside the shared core.
 """
 from __future__ import annotations
 
+import gc
 import time
 from typing import Iterator
+
+WARMUP_PROMPT = "Hello."
 
 
 class TorchBackend:
@@ -114,3 +117,99 @@ def _chat_wrap(tokenizer, prompt: str) -> str:
     except Exception as e:
         print(f"  WARNING: chat template failed ({e}); using raw prompt")
         return prompt
+
+
+ASSISTED_PROMPTS = [
+    ("essay", "Write a long, detailed essay about the history of the "
+              "telescope, covering its invention, major improvements, and "
+              "scientific impact."),
+    ("code", "Write a complete Python implementation of an LRU cache with "
+             "get/put methods, full docstrings, and a small test block."),
+    ("qa", "What is the difference between a hash table and a B-tree?"),
+]
+
+
+def _timed_generate(model, tokenizer, prompt: str, max_tokens: int,
+                    assistant_model=None) -> tuple[int, float]:
+    """Run model.generate (greedy), optionally speculative via
+    assistant_model. Returns (new_tokens, seconds)."""
+    import torch
+
+    ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
+    kwargs = dict(
+        input_ids=ids,
+        max_new_tokens=max_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    if assistant_model is not None:
+        kwargs["assistant_model"] = assistant_model
+    with torch.inference_mode():
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = model.generate(**kwargs)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+    return out.shape[1] - ids.shape[1], dt
+
+
+def cmd_assisted(backend, args) -> None:
+    """Baseline vs assisted (speculative) decode throughput.
+
+    The decision metric is the end-to-end speedup ratio; verifier
+    guarantees output equivalence under greedy decoding, so quality is
+    fixed by construction. transformers does not expose acceptance-rate
+    counters publicly — speedup is what we can measure honestly.
+    """
+    import torch
+
+    if not args.assistant_repo:
+        raise SystemExit("--assistant-repo is required for --cmd assisted")
+
+    label = args.label or args.repo.split("/")[-1]
+    print(f"\n=== {label}: assisted generation "
+          f"(drafter: {args.assistant_repo}) ===")
+    model, tokenizer, t_load = backend.load(args.repo, quant=args.quant)
+    print(f"target loaded in {t_load:.1f}s")
+
+    from transformers import AutoModelForCausalLM
+    t0 = time.perf_counter()
+    try:
+        assistant = AutoModelForCausalLM.from_pretrained(
+            args.assistant_repo, dtype=torch.bfloat16,
+            device_map="cuda:0",
+        )
+    except ValueError:
+        assistant = _auto_load(args.assistant_repo,
+                               {"dtype": torch.bfloat16,
+                                "device_map": "cuda:0"})
+    assistant.eval()
+    print(f"assistant loaded in {time.perf_counter() - t0:.1f}s")
+
+    # Warmup both paths (kernel compile, cache alloc)
+    _timed_generate(model, tokenizer, WARMUP_PROMPT, 8)
+    _timed_generate(model, tokenizer, WARMUP_PROMPT, 8, assistant)
+
+    print(f"\n{'prompt':<8} {'base t/s':>10} {'assisted t/s':>14} "
+          f"{'speedup':>9} {'tokens b/a':>12}")
+    ratios = []
+    for tag, prompt in ASSISTED_PROMPTS:
+        actual = _chat_wrap(tokenizer, prompt) if args.chat else prompt
+        n_base, s_base = _timed_generate(model, tokenizer, actual,
+                                         args.max_tokens)
+        n_asst, s_asst = _timed_generate(model, tokenizer, actual,
+                                         args.max_tokens, assistant)
+        tps_base = n_base / max(s_base, 1e-9)
+        tps_asst = n_asst / max(s_asst, 1e-9)
+        ratio = tps_asst / max(tps_base, 1e-9)
+        ratios.append(ratio)
+        print(f"{tag:<8} {tps_base:>10.1f} {tps_asst:>14.1f} "
+              f"{ratio:>8.2f}x {n_base:>5}/{n_asst}")
+
+    print(f"\nmean speedup: {sum(ratios)/len(ratios):.2f}x "
+          f"(greedy; output token counts may differ slightly if EOS "
+          f"timing shifts)")
+
+    del model, tokenizer, assistant
+    gc.collect()
+    backend.clear_cache()
