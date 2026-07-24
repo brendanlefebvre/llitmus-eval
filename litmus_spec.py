@@ -699,16 +699,8 @@ DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512}
 THINKING_MAX_TOKENS = {"tool-calling": 2048, "constraints": 1536}
 
 
-def _mlx_generate(model, tokenizer, prompt: str, max_tokens: int) -> str:
-    from litmus_common import _resp_text, stream_generate
-    chunks = []
-    for resp in stream_generate(model, tokenizer, prompt, max_tokens=max_tokens):
-        chunks.append(_resp_text(resp))
-    return "".join(chunks)
-
-
 def main() -> None:
-    from litmus_common import _targets_for, _load_timed, _clear_cache
+    from litmus_common import get_backend, _targets_for
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -718,6 +710,7 @@ def main() -> None:
     ap.add_argument("--sizes", default="1.7B,4B,8B")
     ap.add_argument("--repo", default=None)
     ap.add_argument("--label", default=None)
+    ap.add_argument("--backend", choices=["mlx", "cuda", "auto"], default="mlx")
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="ceiling for the non-thinking column")
     ap.add_argument("--think-max-tokens", type=int, default=None,
@@ -733,9 +726,10 @@ def main() -> None:
     cases = load_cases(cases_path, args.profile)   # fail-fast before loading a model
     print(f"loaded {len(cases)} cases from {cases_path}")
 
+    backend = get_backend(args.backend)
     for label, repo in _targets_for(args):
         print(f"\n=== {label}: loading {repo} ===")
-        model, tokenizer, t_load = _load_timed(repo)
+        model, tokenizer, t_load = backend.load(repo)
         print(f"loaded in {t_load:.1f}s")
 
         thinking = supports_thinking(tokenizer)
@@ -759,7 +753,7 @@ def main() -> None:
             tally = {"tokens": 0, "calls": 0}
 
             def gen(p, _budget=budget, _tally=tally):
-                text = _mlx_generate(model, tokenizer, p, _budget)
+                text = "".join(backend.stream(model, tokenizer, p, _budget))
                 _tally["tokens"] += len(tokenizer.encode(text))
                 _tally["calls"] += 1
                 return text
@@ -789,7 +783,7 @@ def main() -> None:
         print(f"sidecar written: {out_path}")
 
         del model, tokenizer
-        _clear_cache()
+        backend.clear_cache()
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@ and the Backend protocol.
 
 Imported by litmus.py (perf benchmarks) and litmus_spec.py (spec-check harness)
 so the two share one loading/targeting path instead of drifting copies. MLX
-helpers live in litmus_mlx.py; the lazy shims below exist only until Phase D
-retires litmus_spec.py's direct MLX imports.
+helpers live in litmus_mlx.py; torch helpers in litmus_torch.py. Backends are
+resolved through get_backend(), keeping this module dependency-free at import.
 """
 from __future__ import annotations
 
@@ -101,26 +101,3 @@ def _targets_for(args) -> list[tuple[str, str]]:
         return [(label, args.repo)]
     return [(size, MODELS[size]) for size in _parse_sizes(args.sizes)]
 
-
-# ---------------------------------------------------------------------------
-# temporary lazy shims for litmus_spec.py (removed in Phase D / Task 10)
-# ---------------------------------------------------------------------------
-
-def stream_generate(*args, **kwargs):
-    from mlx_lm import stream_generate as _impl
-    return _impl(*args, **kwargs)
-
-
-def _resp_text(resp) -> str:
-    from litmus_mlx import _resp_text as _impl
-    return _impl(resp)
-
-
-def _clear_cache() -> None:
-    from litmus_mlx import MLXBackend
-    MLXBackend().clear_cache()
-
-
-def _load_timed(repo: str) -> tuple[object, object, float]:
-    from litmus_mlx import MLXBackend
-    return MLXBackend().load(repo)
