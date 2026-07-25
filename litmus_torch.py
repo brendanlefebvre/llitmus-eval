@@ -58,12 +58,12 @@ class TorchBackend:
             prev_text = ""
             for _ in range(max_tokens):
                 tok = next_id.item()
+                if tok in eos_ids:
+                    return                               # don't count EOS
                 generated.append(tok)
                 full = tokenizer.decode(generated, skip_special_tokens=True)
                 yield full[len(prev_text):]              # incremental delta
                 prev_text = full
-                if tok in eos_ids:
-                    return
                 out = model(input_ids=next_id[:, None],
                             past_key_values=past, use_cache=True)
                 past = out.past_key_values
@@ -172,17 +172,9 @@ def cmd_assisted(backend, args) -> None:
     model, tokenizer, t_load = backend.load(args.repo, quant=args.quant)
     print(f"target loaded in {t_load:.1f}s")
 
-    from transformers import AutoModelForCausalLM
     t0 = time.perf_counter()
-    try:
-        assistant = AutoModelForCausalLM.from_pretrained(
-            args.assistant_repo, dtype=torch.bfloat16,
-            device_map="cuda:0",
-        )
-    except ValueError:
-        assistant = _auto_load(args.assistant_repo,
-                               {"dtype": torch.bfloat16,
-                                "device_map": "cuda:0"})
+    assistant = _auto_load(args.assistant_repo,
+                           {"dtype": torch.bfloat16, "device_map": "cuda:0"})
     assistant.eval()
     print(f"assistant loaded in {time.perf_counter() - t0:.1f}s")
 

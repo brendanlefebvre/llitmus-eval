@@ -54,6 +54,8 @@ def main() -> None:
     ap.add_argument("--reference-text", default=None)
     ap.add_argument("--sizes", default=None)   # unused; --repo is required here
     ap.add_argument("--chat", action="store_true")
+    ap.add_argument("--strip-thinking", action="store_true", default=False,
+                    help="deduct <think>…</think> tokens from useful throughput")
     ap.add_argument("--assistant-repo", default=None)
     args = ap.parse_args()
     if args.reference_text is None:

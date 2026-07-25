@@ -134,8 +134,11 @@ possible to preserve behavior:
 - per-command drivers for all six commands: throughput, perplexity,
   prefill-scaling, decode-stability, baseline, cold-start. All are
   backend-agnostic once they ride on the protocol.
-- `_strip_thinking` (shared with the spec harness's `strip_thinking`; unify or
-  cross-import — decided in the plan)
+- `_strip_thinking` — **stays distinct** from the spec harness's
+  `strip_thinking`. They return different metadata (`(str, int)` scratchpad-token
+  count vs `(str, bool)` tag-found flag) and use different parsing semantics
+  (core applies an untagged-preamble heuristic; the spec harness is tag-only, by
+  design). Unifying them would change evaluation behavior, so they are not shared.
 
 **`litmus_mlx.py` (new)** — `MLXBackend` implementing the protocol. Absorbs the
 MLX bodies of `_load_timed`, `stream_generate`+`_resp_text`, the

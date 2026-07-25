@@ -6,6 +6,7 @@ No LLM judge, no reference model: every check is an objective parser.
 """
 from __future__ import annotations
 
+import gc
 import json
 import re
 from dataclasses import dataclass
@@ -752,9 +753,10 @@ def main() -> None:
         for mode, flag, budget in modes:
             tally = {"tokens": 0, "calls": 0}
 
-            def gen(p, _budget=budget, _tally=tally):
-                text = "".join(backend.stream(model, tokenizer, p, _budget))
-                _tally["tokens"] += len(tokenizer.encode(text))
+            def gen(p, _budget=budget, _tally=tally,
+                    _model=model, _tok=tokenizer):
+                text = "".join(backend.stream(_model, _tok, p, _budget))
+                _tally["tokens"] += len(_tok.encode(text))
                 _tally["calls"] += 1
                 return text
 
@@ -783,6 +785,7 @@ def main() -> None:
         print(f"sidecar written: {out_path}")
 
         del model, tokenizer
+        gc.collect()
         backend.clear_cache()
 
 

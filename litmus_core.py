@@ -508,7 +508,8 @@ def cmd_baseline(backend, args) -> None:
     all_runs: list[Run] = []
     ppls: list[tuple[str, float]] = []
 
-    for name, repo in BASELINE_MODELS.items():
+    targets = _targets_for(args) if args.repo else list(BASELINE_MODELS.items())
+    for name, repo in targets:
         print(f"\n=== {name}: loading {repo} ===")
         model, tokenizer, t_load = backend.load(repo)
         print(f"loaded in {t_load:.1f}s")

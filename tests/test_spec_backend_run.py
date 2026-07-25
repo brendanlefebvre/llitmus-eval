@@ -18,4 +18,7 @@ def test_run_constraints_with_fake_generate():
 
     result = litmus_spec.run_constraints(cases[:2], Tok(), fake_generate,
                                          enable_thinking=None)
-    assert "rows" in result or isinstance(result, dict)
+    assert isinstance(result, dict)
+    assert set(result) >= {"aggregate", "cases", "errored"}
+    assert len(result["cases"]) == 2         # one record per case fed in
+    assert result["errored"] == []           # fake_generate never raises
