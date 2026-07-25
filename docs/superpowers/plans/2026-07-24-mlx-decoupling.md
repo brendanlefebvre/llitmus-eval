@@ -44,7 +44,7 @@
 
 Extract only the functions with **zero runtime MLX dependency** into `litmus_core.py`, pin them with golden tests that run on any machine. `compute_perplexity`, `run_one`, `bench_model`, and the `cmd_*` drivers stay in `litmus.py` for now (they still call `mx`/`stream_generate`); they move in Phase B once the backend seam exists.
 
-### Task A1: Create `litmus_core.py` with the pure helpers
+### Task 1: Create `litmus_core.py` with the pure helpers
 
 **Files:**
 - Create: `litmus_core.py`
@@ -175,7 +175,7 @@ git add litmus_core.py litmus.py
 git commit -m "refactor(core): extract MLX-free pure helpers into litmus_core"
 ```
 
-### Task A2: Golden tests for the pure core
+### Task 2: Golden tests for the pure core
 
 **Files:**
 - Test: `tests/test_core_pure.py` (create)
@@ -303,7 +303,7 @@ git commit -m "test(core): byte-strict golden tests for pure helpers"
 
 Define the seam, implement MLX behind it, move `compute_perplexity`/`run_one`/`bench_model`/`cmd_*` into the core rewritten against a `Backend`, and shrink `litmus.py` to a thin CLI. After this phase, `litmus_core` and `litmus_common` are MLX-free at import.
 
-### Task B1: Define the `Backend` protocol + `get_backend` in `litmus_common`
+### Task 3: Define the `Backend` protocol + `get_backend` in `litmus_common`
 
 **Files:**
 - Modify: `litmus_common.py` (add protocol + selector near top, after the tables)
@@ -420,7 +420,7 @@ git add litmus_common.py tests/test_backend_protocol.py
 git commit -m "feat(backend): define Backend protocol + get_backend selector"
 ```
 
-### Task B2: Implement `MLXBackend` in `litmus_mlx.py`
+### Task 4: Implement `MLXBackend` in `litmus_mlx.py`
 
 **Files:**
 - Create: `litmus_mlx.py`
@@ -524,7 +524,7 @@ git add litmus_mlx.py
 git commit -m "feat(backend): MLXBackend adapter with lazy mlx imports"
 ```
 
-### Task B3: Add `FakeBackend` + move `compute_perplexity` into core (split at the seam)
+### Task 5: Add `FakeBackend` + move `compute_perplexity` into core (split at the seam)
 
 **Files:**
 - Create: `tests/conftest.py`
@@ -666,7 +666,7 @@ git add tests/conftest.py litmus_core.py tests/test_core_perplexity.py
 git commit -m "feat(core): backend-driven compute_perplexity + FakeBackend"
 ```
 
-### Task B4: Move `run_one` / `bench_model` / `_single_ttft` and the six `cmd_*` drivers into core
+### Task 6: Move `run_one` / `bench_model` / `_single_ttft` and the six `cmd_*` drivers into core
 
 **Files:**
 - Modify: `litmus_core.py` (add orchestration + drivers), `litmus.py` (delete moved code, become thin CLI)
@@ -824,7 +824,7 @@ git add litmus_core.py litmus.py tests/test_core_orchestration.py
 git commit -m "refactor(core): move perf orchestration + drivers behind Backend; thin litmus.py CLI"
 ```
 
-### Task B5: Retire the `litmus_common` re-exports and MLX memory helpers
+### Task 7: Retire the `litmus_common` re-exports and MLX memory helpers
 
 **Files:**
 - Modify: `litmus_common.py` (delete `_mlx()`, `__getattr__`, `_LAZY_NAMES`, `_resp_text`, memory helpers, `_load_timed`), `tests/test_common_import.py` (update expectations)
@@ -866,7 +866,7 @@ git commit -m "refactor(common): retire _mlx() shim; MLX helpers now live in lit
 
 Fold `litmus_cuda.py`'s torch logic into `litmus_torch.py` behind the protocol; reduce `litmus_cuda.py` to a thin shim that routes the three shared commands to the core and keeps `assisted` torch-native.
 
-### Task C1: Implement `TorchBackend` in `litmus_torch.py`
+### Task 8: Implement `TorchBackend` in `litmus_torch.py`
 
 **Files:**
 - Create: `litmus_torch.py`
@@ -1049,7 +1049,7 @@ git add litmus_torch.py tests/test_torch_backend.py
 git commit -m "feat(backend): TorchBackend adapter + torch smoke tests"
 ```
 
-### Task C2: Reduce `litmus_cuda.py` to a compat shim
+### Task 9: Reduce `litmus_cuda.py` to a compat shim
 
 **Files:**
 - Modify: `litmus_cuda.py` (replace implementation with a thin shim; move `cmd_assisted` + `ASSISTED_PROMPTS` + `_timed_generate` into `litmus_torch.py`)
@@ -1196,7 +1196,7 @@ git commit -m "refactor(cuda): reduce litmus_cuda to a compat shim over the core
 
 Swap `litmus_spec.py`'s MLX-local model path for the protocol and add `--backend`. The pure loader/parser/scorer code is untouched.
 
-### Task D1: Backend-drive `litmus_spec.py`'s model-running path
+### Task 10: Backend-drive `litmus_spec.py`'s model-running path
 
 **Files:**
 - Modify: `litmus_spec.py:702-789` (`_mlx_generate` + `main`)
@@ -1268,7 +1268,7 @@ git commit -m "refactor(spec): route model-running path through Backend; add --b
 
 ## Phase E — Packaging
 
-### Task E1: Update `pyproject.toml` extras + py-modules
+### Task 11: Update `pyproject.toml` extras + py-modules
 
 **Files:**
 - Modify: `pyproject.toml`
