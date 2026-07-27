@@ -51,8 +51,15 @@ Objective, fixed-input checks of tool-calling and instruction-following:
 
 Tool-calling reports a prompted-JSON column for every model plus a native
 `tools=` column where the chat template supports it (and the gap between them).
-Constraint-following reports IFEval-style strict/loose accuracy. Each run writes
-a `results_<profile>_<label>.json` sidecar for downstream (Loxo) consumption.
+Constraint-following reports three accuracy metrics. `strict` is all-checks-pass
+per case on the raw output. `strict_normalized` is the same rule applied after
+stripping cosmetic wrapping a consumer would remove anyway (matched quotes,
+backtick fences). `loose` is a flat per-check pass rate pooled across all cases
+— weighted by the check inventory of the case file, so adding more
+`forbidden_word` entries raises it without any model changing. It is a
+diagnostic, not a routing metric. `strict_normalized` is the one analogous to
+IFEval-loose. Each run writes a `results_<profile>_<label>.json` sidecar for
+downstream (Loxo) consumption.
 
 The `chore` profile measures thread-title generation (OpenCode's title-generator
 prompt). Its checks are compliance-only (length, format, forbidden prefixes).

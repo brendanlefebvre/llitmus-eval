@@ -140,6 +140,28 @@ class ToolCase:
 _NO_ANSWER = "no answer: thinking budget exhausted (unclosed <think>)"
 
 
+def normalize_output(text: str) -> str:
+    """Clean generated text the way a downstream consumer would before using it.
+
+    The discipline: if the consumer of this output would do this anyway, it is
+    normalization. If not, it is score inflation. Specifically:
+    - strip surrounding whitespace
+    - strip a MATCHED pair of wrapping quotes (double or single), not stray
+      quote characters elsewhere in the string
+    - strip matched wrapping backticks or triple-backtick code fences
+
+    Does NOT strip a "Title:" prefix — forbidden_word exists to catch exactly
+    that, and removing it would launder a real defect.
+    """
+    s = text.strip()
+    if len(s) >= 2:
+        if s.startswith("`" * 3) and s.endswith("`" * 3):
+            s = s[3:-3].strip()
+        elif s[0] == s[-1] and s[0] in ('"', "'", "`"):
+            s = s[1:-1].strip()
+    return s
+
+
 def score_constraint_case(text: str, case: "ConstraintCase",
                           closed: bool = True) -> list:
     """Score `text` against a case's checks.
@@ -160,7 +182,8 @@ def score_constraint_case(text: str, case: "ConstraintCase",
     return out
 
 
-def aggregate_constraints(per_case: list) -> dict:
+def aggregate_constraints(per_case: list,
+                          per_case_normalized: Optional[list] = None) -> dict:
     n_cases = len(per_case)
     strict_pass = sum(1 for checks in per_case if checks and all(c["passed"] for c in checks))
     all_checks = [c for checks in per_case for c in checks]
@@ -169,12 +192,18 @@ def aggregate_constraints(per_case: list) -> dict:
     for c in all_checks:
         by_kind.setdefault(c["kind"], []).append(c["passed"])
     by_kind_rate = {k: sum(v) / len(v) for k, v in by_kind.items()}
-    return {
+    result = {
         "strict": (strict_pass / n_cases) if n_cases else 0.0,
         "loose": loose,
         "by_kind": by_kind_rate,
         "n_cases": n_cases,
     }
+    if per_case_normalized is not None:
+        sn_pass = sum(1 for checks in per_case_normalized
+                      if checks and all(c["passed"] for c in checks))
+        result["strict_normalized"] = (sn_pass / len(per_case_normalized)
+                                       if per_case_normalized else 0.0)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +543,7 @@ def build_constraint_prompt(tokenizer, case: "ConstraintCase",
 
 def run_constraints(cases: list, tokenizer, generate_fn,
                     enable_thinking=None) -> dict:
-    per_case_checks, records, errored = [], [], []
+    per_case_checks, per_case_norm, records, errored = [], [], [], []
     for case in cases:
         prompt = build_constraint_prompt(tokenizer, case,
                                          enable_thinking=enable_thinking)
@@ -527,10 +556,17 @@ def run_constraints(cases: list, tokenizer, generate_fn,
         text, closed = strip_thinking(raw)
         checks = score_constraint_case(text, case, closed=closed)
         per_case_checks.append(checks)
+        # Re-score against the consumer-normalized text to isolate cosmetic
+        # failures (wrapping quotes, code fences) from real defects.
+        norm_text = normalize_output(text)
+        norm_checks = score_constraint_case(norm_text, case, closed=closed)
+        per_case_norm.append(norm_checks)
         records.append({"id": case.id, "checks": checks,
+                        "normalized_checks": norm_checks,
                         "output_sample": text[:200],
                         "thinking_unclosed": not closed})
-    return {"aggregate": aggregate_constraints(per_case_checks),
+    return {"aggregate": aggregate_constraints(per_case_checks,
+                                               per_case_norm),
             "cases": records, "errored": errored}
 
 
