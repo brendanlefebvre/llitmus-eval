@@ -56,9 +56,12 @@ a `results_<profile>_<label>.json` sidecar for downstream (Loxo) consumption.
 
 The `chore` profile measures thread-title generation (OpenCode's title-generator
 prompt). Its checks are compliance-only (length, format, forbidden prefixes).
-Current cases saturate at strict=1.00 for both think and no-think modes on a
-14B model, so the score does not discriminate between models — routing for
-this class falls to cost, not adequacy.
+Measured across three models, compliance discriminates: Qwen3-14B saturates at
+strict=1.00 in both think and no-think; Qwen3-4B drops to 0.83 in no-think
+(word-count overflow) but reaches 1.00 with thinking; Llama-3.2-1B scores 0.00
+(wraps every title in quotes). The floor is between 1B and 4B. For models at
+or above the floor, routing falls to cost — 14B no-think is the clear pick
+(1.00 compliance at 8 tok/case).
 
 ## Why "Litmus"
 

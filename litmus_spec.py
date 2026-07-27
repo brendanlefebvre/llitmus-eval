@@ -242,10 +242,12 @@ def _load_tool_line(obj: dict, ln: int) -> "ToolCase":
 
 def load_cases(path: str, profile: str) -> list:
     # chore: reuses the constraints loader/runner. Checks are compliance-only
-    # (length, format, forbidden prefixes); current cases saturate at
-    # strict=1.00 for both think and no-think on a 14B model, so the score
-    # does not discriminate between models — routing for this class falls to
-    # cost, not adequacy.
+    # (length, format, forbidden prefixes). The profile discriminates: 14B
+    # saturates at strict=1.00 both modes, 4B drops to 0.83 in no-think
+    # (word-count overflow) but 1.00 with thinking, 1B Llama scores 0.00
+    # (wraps titles in quotes). Floor is between 1B and 4B. An earlier claim
+    # that the profile "does not discriminate" was drawn from the 14B alone
+    # and was wrong.
     loader = {"constraints": _load_constraint_line,
               "chore": _load_constraint_line,
               "tool-calling": _load_tool_line}.get(profile)
