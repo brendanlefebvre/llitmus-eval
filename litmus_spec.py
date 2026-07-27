@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -694,7 +695,8 @@ def format_thinking_gap(label: str, per_mode: dict, profile: str,
 def write_sidecar(path: str, profile: str, model: str, label: str,
                   convention_support: dict, result: dict,
                   modes: Optional[dict] = None,
-                  tokens_per_case: Optional[dict] = None) -> None:
+                  tokens_per_case: Optional[dict] = None,
+                  cost: Optional[dict] = None) -> None:
     payload = {
         "profile": profile,
         "model": model,
@@ -706,6 +708,9 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
         "cases": result.get("cases", []),
         "errored": result.get("errored", []),
     }
+    if cost:
+        payload["load_ms"] = cost.get("load_ms")
+        payload["peak_memory_mb"] = cost.get("peak_memory_mb")
     # Top-level keys stay the primary (thinking, where supported) result so the
     # sidecar contract holds; per-mode detail rides alongside for Loxo, which
     # needs the accuracy/token trade-off to route.
@@ -713,7 +718,12 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
         payload["modes"] = {
             m: {"aggregate": r["aggregate"], "cases": r.get("cases", []),
                 "errored": r.get("errored", []),
-                "mean_tokens_per_case": (tokens_per_case or {}).get(m)}
+                "mean_tokens_per_case": (tokens_per_case or {}).get(m),
+                "median_latency_ms": (cost or {}).get("median_latency_ms", {}).get(m),
+                "latencies_ms": (cost or {}).get("latencies_ms", {}).get(m),
+                "tokens_per_second": (cost or {}).get("tokens_per_second", {}).get(m),
+                "peak_memory_mb": (cost or {}).get("peak_memory_mb"),
+                "load_ms": (cost or {}).get("load_ms")}
             for m, r in modes.items()
         }
     with open(path, "w", encoding="utf-8") as f:
@@ -726,6 +736,7 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
 
 import argparse
 import os
+import statistics
 
 DEFAULT_CASES = {
     "tool-calling": "cases/tool_calling.jsonl",
@@ -775,6 +786,7 @@ def main() -> None:
     backend = get_backend(args.backend)
     for label, repo in _targets_for(args):
         print(f"\n=== {label}: loading {repo} ===")
+        backend.reset_peak_memory()
         model, tokenizer, t_load = backend.load(repo)
         print(f"loaded in {t_load:.1f}s")
 
@@ -795,12 +807,17 @@ def main() -> None:
               f" | native tools: {'yes' if native else 'no'}")
 
         per_mode, tokens_per_case = {}, {}
+        median_latency_ms, latencies_ms, tokens_per_second = {}, {}, {}
         for mode, flag, budget in modes:
-            tally = {"tokens": 0, "calls": 0}
+            tally = {"tokens": 0, "calls": 0, "latencies": [], "gen_seconds": 0.0}
 
             def gen(p, _budget=budget, _tally=tally,
                     _model=model, _tok=tokenizer):
+                t0 = time.perf_counter()
                 text = "".join(backend.stream(_model, _tok, p, _budget))
+                elapsed = time.perf_counter() - t0
+                _tally["latencies"].append(elapsed * 1000)
+                _tally["gen_seconds"] += elapsed
                 _tally["tokens"] += len(_tok.encode(text))
                 _tally["calls"] += 1
                 return text
@@ -817,6 +834,15 @@ def main() -> None:
             per_mode[mode] = result
             tokens_per_case[mode] = (tally["tokens"] / tally["calls"]
                                      if tally["calls"] else 0.0)
+            latencies_ms[mode] = [round(x, 1) for x in tally["latencies"]]
+            median_latency_ms[mode] = (statistics.median(tally["latencies"])
+                                       if tally["latencies"] else 0.0)
+            tokens_per_second[mode] = (tally["tokens"] / tally["gen_seconds"]
+                                       if tally["gen_seconds"] > 0 else 0.0)
+            print(f"  median latency: {median_latency_ms[mode]:.0f} ms  "
+                  f"tok/sec: {tokens_per_second[mode]:.1f}")
+
+        peak_mb = backend.peak_memory_mb()
 
         if thinking:
             print("\n" + format_thinking_gap(label, per_mode, args.profile,
@@ -825,9 +851,15 @@ def main() -> None:
 
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label)
         out_path = os.path.join(args.out_dir, f"results_{args.profile}_{safe}.json")
+        cost = {"median_latency_ms": median_latency_ms,
+                "latencies_ms": latencies_ms,
+                "tokens_per_second": tokens_per_second,
+                "peak_memory_mb": peak_mb,
+                "load_ms": round(t_load * 1000)}
         write_sidecar(out_path, args.profile, repo, label, conv, primary,
-                      modes=per_mode, tokens_per_case=tokens_per_case)
-        print(f"sidecar written: {out_path}")
+                      modes=per_mode, tokens_per_case=tokens_per_case,
+                      cost=cost)
+        print(f"sidecar written: {out_path}  (peak: {peak_mb:.0f} MB)")
 
         del model, tokenizer
         gc.collect()
