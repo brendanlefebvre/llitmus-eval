@@ -47,11 +47,18 @@ Objective, fixed-input checks of tool-calling and instruction-following:
 
     python litmus_spec.py --profile constraints --repo <hf-org/model-mlx>
     python litmus_spec.py --profile tool-calling --repo <hf-org/model-mlx>
+    python litmus_spec.py --profile chore --repo <hf-org/model-mlx>
 
 Tool-calling reports a prompted-JSON column for every model plus a native
 `tools=` column where the chat template supports it (and the gap between them).
 Constraint-following reports IFEval-style strict/loose accuracy. Each run writes
 a `results_<profile>_<label>.json` sidecar for downstream (Loxo) consumption.
+
+The `chore` profile measures thread-title generation (OpenCode's title-generator
+prompt). Its checks are compliance-only (length, format, forbidden prefixes).
+Current cases saturate at strict=1.00 for both think and no-think modes on a
+14B model, so the score does not discriminate between models — routing for
+this class falls to cost, not adequacy.
 
 ## Why "Litmus"
 

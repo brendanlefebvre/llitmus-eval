@@ -241,7 +241,13 @@ def _load_tool_line(obj: dict, ln: int) -> "ToolCase":
 
 
 def load_cases(path: str, profile: str) -> list:
+    # chore: reuses the constraints loader/runner. Checks are compliance-only
+    # (length, format, forbidden prefixes); current cases saturate at
+    # strict=1.00 for both think and no-think on a 14B model, so the score
+    # does not discriminate between models — routing for this class falls to
+    # cost, not adequacy.
     loader = {"constraints": _load_constraint_line,
+              "chore": _load_constraint_line,
               "tool-calling": _load_tool_line}.get(profile)
     if loader is None:
         raise CaseError(f"unknown profile '{profile}'")
@@ -621,7 +627,7 @@ def format_constraint_table(label: str, result: dict) -> str:
 def _headline(result: dict, profile: str) -> float:
     """The one number a thinking/no-thinking comparison turns on."""
     agg = result["aggregate"]
-    if profile == "constraints":
+    if profile in ("constraints", "chore"):
         return agg["strict"] or 0.0
     return (agg["prompted"] or {}).get("right_tool") or 0.0
 
@@ -636,7 +642,7 @@ def format_thinking_gap(label: str, per_mode: dict, profile: str,
     """
     off, on = per_mode["no-think"], per_mode["think"]
     gap = _headline(on, profile) - _headline(off, profile)
-    metric = "strict" if profile == "constraints" else "right_tool"
+    metric = "strict" if profile in ("constraints", "chore") else "right_tool"
     t_off = tokens_per_case.get("no-think") or 0.0
     t_on = tokens_per_case.get("think") or 0.0
     cost = f"{t_off:.0f} -> {t_on:.0f} tok/case"
@@ -686,8 +692,9 @@ import os
 DEFAULT_CASES = {
     "tool-calling": "cases/tool_calling.jsonl",
     "constraints": "cases/constraints.jsonl",
+    "chore": "cases/chore.jsonl",
 }
-DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512}
+DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512, "chore": 64}
 
 # Reasoning models need room for the scratchpad on top of the answer. Measured
 # on Ternary-Bonsai-27B-mlx-2bit (2026-07-15): the <think> preamble alone runs
@@ -697,7 +704,7 @@ DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512}
 # loops "I will output the JSON / One last check" past 8192), and scores as a
 # miss. max_tokens is a ceiling, not a target: non-thinking models stop at EOS
 # well short of it, so raising this does not perturb their scores.
-THINKING_MAX_TOKENS = {"tool-calling": 2048, "constraints": 1536}
+THINKING_MAX_TOKENS = {"tool-calling": 2048, "constraints": 1536, "chore": 4096}
 
 
 def main() -> None:
@@ -706,7 +713,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", required=True,
-                    choices=["tool-calling", "constraints"])
+                    choices=["tool-calling", "constraints", "chore"])
     ap.add_argument("--cases", default=None, help="JSONL case file (default per profile)")
     ap.add_argument("--sizes", default="1.7B,4B,8B")
     ap.add_argument("--repo", default=None)
@@ -761,7 +768,7 @@ def main() -> None:
                 return text
 
             print(f"\n--- {label} [{mode}] (max_tokens={budget}) ---")
-            if args.profile == "constraints":
+            if args.profile in ("constraints", "chore"):
                 result = run_constraints(cases, tokenizer, gen,
                                          enable_thinking=flag)
                 print(format_constraint_table(f"{label} [{mode}]", result))
