@@ -954,6 +954,17 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
             capture_tools = body.get("tools") or []
             prompt = build_replay_prompt(tokenizer, case, native,
                                          enable_thinking=enable_thinking)
+            # Truncation gate (F3a): record the token count the model is
+            # actually fed by encoding the rendered prompt. This is the only
+            # number that can surface silent truncation on deep cases (40–60k
+            # tokens) — est_tokens is the extractor's pre-template estimate
+            # and can't see template overhead or context-window clipping. A
+            # tokenizer without encode() (e.g. a stub) records None rather
+            # than crashing the run.
+            try:
+                prompt_tokens_fed = len(tokenizer.encode(prompt))
+            except Exception:
+                prompt_tokens_fed = None
             raw = generate_fn(prompt, max_tokens=max_tokens)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
@@ -973,6 +984,8 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
             "depth_stratum": case.depth_stratum, "native": native,
             "score": score, "output_sample": text[:200],
             "thinking_unclosed": not closed,
+            "prompt_tokens_fed": prompt_tokens_fed,
+            "est_tokens": case.est_tokens,
         })
     return {"aggregate": aggregate_replay(per_case_scores),
             "cases": records, "errored": errored}

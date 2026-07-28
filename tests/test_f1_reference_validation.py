@@ -223,23 +223,32 @@ def test_f1_reference_self_validation():
 
 
 # ---------------------------------------------------------------------------
-# F3a
+# est_tokens drift check (formerly mislabelled "F3a")
 # ---------------------------------------------------------------------------
 
-def test_f3a_no_truncation_case_estimates():
-    """F3a: each case's est_tokens must match estimate_prompt_tokens(capture body).
+def test_est_tokens_drift_check():
+    """est_tokens drift check: each case's est_tokens must match
+    estimate_prompt_tokens(capture body).
 
-    The full no-truncation gate needs a model run (a runtime check in the
-    runner), but this catches extraction drift: if the tokenizer's count of
-    the captured prompt no longer matches what the extractor recorded, the
-    case's depth stratum may be wrong.
+    This is NOT the F3a truncation gate — that lives in run_main_replay as the
+    per-case ``prompt_tokens_fed`` recording, which compares the tokenizer's
+    count of the *rendered* prompt against what the model actually consumed.
+    This test instead catches extraction drift: if the tokenizer's count of the
+    captured prompt no longer matches what the extractor recorded, the case's
+    depth stratum may be wrong. Estimator-vs-itself can't detect truncation,
+    but it can detect a stale case file.
+
+    Skip is per-case (collected into a list) rather than via pytest.skip,
+    which aborts the whole loop on the first missing capture.
     """
     cases = _require_cases()
 
     mismatches = []
+    skipped = []
     for case in cases:
         if not os.path.exists(case.capture_path):
-            pytest.skip(f"capture not accessible: {case.capture_path}")
+            skipped.append(case.id)
+            continue
         body = _load_capture(case.capture_path)
         expected = estimate_prompt_tokens(body)
         if case.est_tokens != expected:
@@ -248,7 +257,12 @@ def test_f3a_no_truncation_case_estimates():
                 f"estimate_prompt_tokens={expected}"
             )
 
+    if skipped:
+        print(f"  (skipped {len(skipped)} case(s) with missing captures: "
+              f"{', '.join(skipped)})")
+
     assert not mismatches, (
-        "F3a FAILED: case est_tokens drift from estimate_prompt_tokens:\n"
+        "est_tokens drift: case est_tokens no longer match "
+        "estimate_prompt_tokens(capture body):\n"
         + "\n".join(mismatches)
     )

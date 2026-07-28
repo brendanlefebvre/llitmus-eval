@@ -568,6 +568,11 @@ class ReplayFakeTokenizer:
         self.last_enable_thinking = kw.get("enable_thinking")
         return "PROMPT:" + (messages[-1]["content"] if messages else "")
 
+    def encode(self, text):
+        # Deterministic, content-dependent token count for F3a tests: one
+        # token per whitespace-separated word. Mirrors the conftest stub.
+        return text.split()
+
 
 class TestBuildReplayPrompt:
     def test_native_forwards_captured_tools(self, tmp_path):
@@ -810,6 +815,32 @@ class TestRunMainReplay:
         assert agg["by_depth"]["mid"] == {"action_valid": 0.0, "n": 1}
         # weighted: 1.0*0.075 + 0.0*0.383 = 0.075
         assert agg["action_valid_weighted"] == pytest.approx(0.075)
+
+    def test_runner_records_prompt_tokens_fed(self, tmp_path):
+        """F3a: each per-case record carries prompt_tokens_fed (the count of
+        tokens the model was actually fed) and est_tokens (the extractor's
+        pre-template estimate). prompt_tokens_fed is the only number that can
+        surface silent truncation on deep cases.
+        """
+        msgs = [{"role": "system", "content": "sys"},
+                {"role": "user", "content": "read the file"}]
+        cap = _make_capture(tmp_path, "req-1.json", messages=msgs,
+                            tools=[READ_TOOL], max_tokens=32000)
+        case = _replay_case(cap, acted=True, tools=["read"],
+                            arguments=[{"filePath": "x"}], est_tokens=20000)
+        tok = ReplayFakeTokenizer()
+
+        seen_prompt = {}
+        def gen(prompt, max_tokens=0):
+            seen_prompt["prompt"] = prompt
+            return '{"tool": "read", "arguments": {"filePath": "f"}}'
+
+        result = run_main_replay([case], tok, gen, native=False)
+        rec = result["cases"][0]
+        assert "prompt_tokens_fed" in rec
+        assert rec["prompt_tokens_fed"] == len(seen_prompt["prompt"].split())
+        # est_tokens is echoed from the case for sidecar-side comparison.
+        assert rec["est_tokens"] == 20000
 
 
 # ===========================================================================
