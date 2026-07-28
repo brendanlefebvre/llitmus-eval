@@ -604,6 +604,10 @@ def score_replay_call(parsed: "ParsedCall", case: "ReplayCase",
     if not candidate_acted:
         # No tool call: tool_exists is vacuously satisfied; args_schema is not
         # checkable. action_valid turns on acted_ok + well_formed only.
+        # When the candidate correctly abstained (ref didn't act either), the
+        # prose response is itself well-formed — mirrors score_tool_call's
+        # native abstention handling (well_formed = True if abstained_ok).
+        well_formed = True if acted_ok else parsed.well_formed
         return {"acted_ok": acted_ok, "well_formed": well_formed,
                 "tool_exists": True, "args_schema_ok": None,
                 "action_valid": acted_ok and well_formed}

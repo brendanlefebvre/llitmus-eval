@@ -542,15 +542,16 @@ class TestRunMainReplay:
         case = _replay_case(cap, acted=False)
         tok = ReplayFakeTokenizer()
         # model responds in prose: no JSON object -> parse_prompted returns
-        # well_formed False, tool None. acted_ok True (no call), but
-        # well_formed False, so action_valid False.
+        # well_formed False, tool None. acted_ok True (no call). A correct
+        # abstention is itself well-formed (mirrors score_tool_call's native
+        # abstention handling), so well_formed True and action_valid True.
         result = run_main_replay([case], tok,
                                  lambda p, max_tokens=0: "The answer is 4.",
                                  native=False)
         score = result["cases"][0]["score"]
         assert score["acted_ok"] is True   # ref didn't act, candidate didn't act
-        assert score["well_formed"] is False  # prose is not a well-formed tool call
-        assert score["action_valid"] is False
+        assert score["well_formed"] is True  # correct abstention is well-formed
+        assert score["action_valid"] is True
 
     def test_native_runner_correct_call(self, tmp_path):
         cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
