@@ -2,7 +2,9 @@
 
 **Status:** Proposed — design only, no implementation. Revised 2026-07-28 per
 measurement review (chain structure, authoritative depth profile, reference-set
-identity, weighting, F3 split, confound). A recommendation to argue with.
+identity, weighting, F3 split, confound). Revised again 2026-07-28 post
+code-review: prompted-mode convention resolved, F1 made per-dimension. A
+recommendation to argue with.
 **Date:** 2026-07-27, revised 2026-07-28
 **Inputs:** 137 captures (129 `main`) in `~/.local/state/loxo-llm-router/captures/`,
 the Litmus tool-calling profile, the Loxo adequacy ledger, learnings entries of
@@ -72,7 +74,15 @@ Pure validators in the existing `litmus_spec.py` style, no judgment:
 - `well_formed` — the action parses, via the existing `parse_native` /
   `parse_prompted` machinery, under the same fixed-convention rule as the
   tool-calling profile (native `tools=` where supported, prompted JSON
-  otherwise; report which).
+  otherwise; report which). **For non-native models the prompted convention
+  must be shown to the model:** `_PROMPTED_SYSTEM` plus the request's own tool
+  schemas are appended as an additional system message. This is the sole
+  deliberate deviation from body-verbatim, and it exists because the captured
+  system prompt teaches the serving harness's native protocol, not the litmus
+  prompted shape — grading a model on a format it was never shown measures the
+  harness, not the model (2026-07-28 review, verified: all three increment-1
+  candidates register non-native, so an uninstructed prompted path would have
+  been the *only* path exercised). Everything else in the body stays verbatim.
 - `tool_exists` — named tool is one of the 11 in the request's own `tools`
   array.
 - `args_schema_ok` — required keys present, types correct, **no hallucinated
@@ -265,9 +275,14 @@ or failure-to-act at all.
 
 - **F1 — reference self-validation.** Run the tier-0 validators over the
   *reference actions themselves*. They are real production actions from
-  glm-5.2; they must pass ≈100%. Any systematic failure means the harness is
-  measuring itself, not the model (the `parse_native` failure mode). Hard stop
-  until fixed.
+  glm-5.2; they must pass ≈100% — **reported and gated per dimension**
+  (`acted_ok`, `well_formed`, `tool_exists`, `args_schema_ok` each ≈1.0, with
+  uncheckable dimensions excluded from denominators per `_rate()` semantics),
+  never as one pooled number. The diagnostic value of F1 is *which* dimension
+  fails: `args_schema_ok` failures indict the schema validator, `well_formed`
+  the parser (the `parse_native` failure mode), `acted_ok` the reference
+  extraction. A pooled rate hides exactly that signal. Any systematic failure
+  means the harness is measuring itself, not the model. Hard stop until fixed.
 - **F2 — known-good/known-bad separation.** Llama-3.2-1B vs Qwen3-14B on
   `action_valid`. The chore eval showed the 1B matching the 14B on compliance;
   if that happens *here* — the 1B holding a high valid-action rate on 11-tool,
