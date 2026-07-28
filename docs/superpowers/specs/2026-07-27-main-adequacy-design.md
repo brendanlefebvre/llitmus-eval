@@ -89,8 +89,9 @@ Pure validators in the existing `litmus_spec.py` style, no judgment:
   keys**. Schema-validation, deliberately *not* the tool-calling profile's
   exact-value equality: at a real mid-session decision point there is no single
   correct argument value, but there is exactly one schema.
-- Thinking-budget guard: an unclosed `<think>` scores all-false, as in the
-  existing profiles.
+- Thinking-budget guard: an unclosed `<think>` means nothing was produced;
+  scoring follows the dimension-applicability rule below (`acted_ok=False`,
+  remaining dimensions `None`).
 
 **Dimension applicability rule (2026-07-28):** a dimension that is not
 applicable to a case is `None`, never `False` — `False` means "checked and
