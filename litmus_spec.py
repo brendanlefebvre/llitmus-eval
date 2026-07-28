@@ -1005,8 +1005,60 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool,
     }
 
 
+def _fmt_secs(s: float) -> str:
+    """Compact duration: 42s, 3m20s, 1h04m."""
+    s = int(round(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def _replay_progress_line(i: int, total: int, case, outcome: str,
+                          case_secs: float, remaining: list,
+                          stratum_secs: dict, detail: str = "") -> str:
+    """Format one per-case progress line.
+
+    Carries the stratum because per-case cost varies by several multiples
+    across strata — seeing which stratum a slow case belonged to is most of
+    the diagnostic value, and it makes the ETA's variance legible rather than
+    mysterious.
+    """
+    eta = _replay_eta_secs(remaining, stratum_secs)
+    eta_s = f"  eta ~{_fmt_secs(eta)}" if eta is not None else ""
+    tail = f"  {detail}" if detail else ""
+    return (f"[{i:>3}/{total}] {getattr(case, 'id', '?'):<8} "
+            f"{getattr(case, 'depth_stratum', '?'):<8} {outcome:<14} "
+            f"{_fmt_secs(case_secs):>7}{eta_s}{tail}")
+
+
+def _replay_eta_secs(remaining: list, stratum_secs: dict) -> Optional[float]:
+    """Project remaining wall-clock, priced per stratum.
+
+    Deep cases carry 40-60k prompt tokens against a shallow case's <16k, so
+    they cost several times more. A pooled mean projected onto a stratified
+    queue is therefore wrong by whatever the remaining mix happens to be —
+    badly optimistic while the shallow cases are being drained, badly
+    pessimistic afterwards. Each remaining case is priced by its own
+    stratum's observed mean, falling back to the pooled mean for a stratum
+    that has not completed a case yet. Returns None before anything has
+    finished, rather than inventing a number from no data.
+    """
+    observed = [x for v in stratum_secs.values() for x in v]
+    if not observed:
+        return None
+    pooled_mean = sum(observed) / len(observed)
+    total = 0.0
+    for case in remaining:
+        samples = stratum_secs.get(getattr(case, "depth_stratum", None))
+        total += (sum(samples) / len(samples)) if samples else pooled_mean
+    return total
+
+
 def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
-                    enable_thinking=None, depth_weights: dict | None = None) -> dict:
+                    enable_thinking=None, depth_weights: dict | None = None,
+                    progress: Optional[Callable[[str], None]] = None) -> dict:
     """Replay captured LLM request bodies through a local model and score tier-0.
 
     The prompt is the captured request body verbatim by reference: the runner
@@ -1017,9 +1069,18 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
 
     Unlike run_tool_calling, each case runs in a single convention (native if
     the model supports tools, prompted otherwise) — there is no paired column.
+
+    `progress` is an optional sink called with one formatted line per case as
+    it completes (the CLI passes `print`; tests leave it None so the library
+    stays quiet). A full matrix is tens of minutes to hours of wall-clock and
+    previously emitted nothing until a mode finished, so a stalled run was
+    indistinguishable from a slow one.
     """
     per_case_scores, records, errored = [], [], []
-    for case in cases:
+    total = len(cases)
+    stratum_secs: dict = {}
+    for i, case in enumerate(cases, 1):
+        t_case = time.monotonic()
         try:
             with open(case.capture_path, encoding="utf-8") as f:
                 body = json.load(f)
@@ -1057,7 +1118,16 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
             raw = generate_fn(prompt, max_tokens=max_tokens)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
+            if progress is not None:
+                # Errored cases are deliberately NOT fed into stratum_secs: a
+                # case that failed to render consumed no generation time, and
+                # averaging it in would make the ETA optimistic in precisely
+                # the run where things are going wrong.
+                progress(_replay_progress_line(
+                    i, total, case, "ERROR", time.monotonic() - t_case,
+                    cases[i:], stratum_secs, detail=str(e)[:60]))
             continue
+        case_secs = time.monotonic() - t_case
         text, closed = strip_thinking(raw)
         parsed = parse_native(text) if native else parse_prompted(text)
         score = score_replay_call(parsed, case, capture_tools, closed=closed)
@@ -1078,7 +1148,15 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
         }
         if tokens_fed_error is not None:
             rec["tokens_fed_error"] = tokens_fed_error
+        rec["case_secs"] = round(case_secs, 2)
         records.append(rec)
+        stratum_secs.setdefault(case.depth_stratum, []).append(case_secs)
+        if progress is not None:
+            av = score.get("action_valid")
+            outcome = "valid" if av else ("unclosed-think" if not closed
+                                          else "invalid")
+            progress(_replay_progress_line(
+                i, total, case, outcome, case_secs, cases[i:], stratum_secs))
     return {"aggregate": aggregate_replay(per_case_scores,
                                           depth_weights=depth_weights),
             "cases": records, "errored": errored}
@@ -1370,7 +1448,8 @@ def main() -> None:
             elif args.profile == "main-replay":
                 result = run_main_replay(cases, tokenizer, gen, native=native,
                                          enable_thinking=flag,
-                                         depth_weights=replay_weights)
+                                         depth_weights=replay_weights,
+                                         progress=print)
                 print(format_replay_table(f"{label} [{mode}]", result))
             else:
                 result = run_tool_calling(cases, tokenizer, gen, native=native,

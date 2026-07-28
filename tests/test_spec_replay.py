@@ -7,7 +7,7 @@ from litmus_spec import (
     CaseError, ReplayCase, ParsedCall, load_cases,
     score_replay_call, aggregate_replay, run_main_replay,
     build_replay_prompt, format_replay_table, _check_args_schema,
-    _capture_tool_names, _capture_tool_params,
+    _capture_tool_names, _capture_tool_params, _replay_eta_secs, _fmt_secs,
 )
 
 # Build tool-call tag strings via chr() so the literal markers never appear
@@ -1128,3 +1128,82 @@ class TestLoadAndRun:
         result = run_main_replay(cases, tok, gen, native=False)
         assert result["aggregate"]["by_depth"]["mid"]["action_valid"] == 1.0
         assert result["aggregate"]["n_cases"] == 1
+
+
+# ---------------------------------------------------------------------------
+# per-case progress reporting
+# ---------------------------------------------------------------------------
+
+class TestReplayProgress:
+    """A matrix run is tens of minutes to hours; it used to emit nothing until
+    a mode finished, so a stalled run looked identical to a slow one."""
+
+    def test_silent_by_default(self, tmp_path, capsys):
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap)
+        run_main_replay([case], ReplayFakeTokenizer(),
+                        lambda p, max_tokens=0: '{"name":"read","arguments":{}}',
+                        native=False)
+        # library stays quiet unless a sink is supplied
+        assert capsys.readouterr().out == ""
+
+    def test_one_line_per_case_with_index_and_stratum(self, tmp_path):
+        caps = [_make_capture(tmp_path, f"req-{i}.json", tools=[READ_TOOL])
+                for i in range(3)]
+        cases = [_replay_case(c, id_=f"mr-00{i}",
+                              depth_stratum=("shallow", "mid", "deep")[i])
+                 for i, c in enumerate(caps)]
+        lines = []
+        run_main_replay(cases, ReplayFakeTokenizer(),
+                        lambda p, max_tokens=0: '{"name":"read","arguments":{}}',
+                        native=False, progress=lines.append)
+        assert len(lines) == 3
+        assert "[  1/3]" in lines[0] and "shallow" in lines[0]
+        assert "[  3/3]" in lines[2] and "deep" in lines[2]
+
+    def test_errored_case_reports_and_does_not_feed_the_eta(self, tmp_path):
+        """An errored case consumed no generation time. Averaging it in would
+        make the ETA optimistic in exactly the run where things go wrong."""
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap, id_="mr-001", depth_stratum="deep")
+        lines = []
+        result = run_main_replay(
+            [case], ReplayFakeTokenizer(),
+            lambda p, max_tokens=0: (_ for _ in ()).throw(RuntimeError("boom")),
+            native=False, progress=lines.append)
+        assert len(lines) == 1 and "ERROR" in lines[0] and "boom" in lines[0]
+        assert result["errored"][0]["id"] == "mr-001"
+        assert result["cases"] == []
+
+    def test_case_secs_recorded(self, tmp_path):
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap)
+        result = run_main_replay(
+            [case], ReplayFakeTokenizer(),
+            lambda p, max_tokens=0: '{"name":"read","arguments":{}}',
+            native=False)
+        assert isinstance(result["cases"][0]["case_secs"], float)
+
+
+class TestReplayEta:
+    def test_none_before_any_case_completes(self):
+        assert _replay_eta_secs([_Stratum("deep")], {}) is None
+
+    def test_prices_each_remaining_case_by_its_own_stratum(self):
+        """Deep cases carry 40-60k prompt tokens against shallow's <16k. A
+        pooled mean projected onto a stratified queue is wrong by whatever the
+        remaining mix happens to be."""
+        observed = {"shallow": [1.0, 1.0], "deep": [10.0]}
+        remaining = [_Stratum("deep"), _Stratum("shallow"), _Stratum("mid")]
+        # deep 10 + shallow 1 + mid falls back to pooled mean (12/3 = 4)
+        assert _replay_eta_secs(remaining, observed) == pytest.approx(15.0)
+
+    def test_pooled_fallback_only_for_unobserved_strata(self):
+        observed = {"deep": [8.0]}
+        assert _replay_eta_secs([_Stratum("deep")], observed) == pytest.approx(8.0)
+
+
+class _Stratum:
+    """Minimal stand-in: the ETA only reads .depth_stratum."""
+    def __init__(self, stratum):
+        self.depth_stratum = stratum
