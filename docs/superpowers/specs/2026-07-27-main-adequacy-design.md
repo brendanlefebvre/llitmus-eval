@@ -92,7 +92,19 @@ Pure validators in the existing `litmus_spec.py` style, no judgment:
 - Thinking-budget guard: an unclosed `<think>` scores all-false, as in the
   existing profiles.
 
-`action_valid` = all of the above per case. This is the hard gate: a model
+**Dimension applicability rule (2026-07-28):** a dimension that is not
+applicable to a case is `None`, never `False` — `False` means "checked and
+failed," `None` means "not a meaningful question here" (e.g. `well_formed`
+when the model chose prose without ever attempting a call; every unproduced
+dimension after a thinking-budget overrun, where only `acted_ok=False`
+stands). `by_dimension` rates skip `None` and report each dimension's
+applicable-case denominator alongside the rate — a rate over an unstated
+denominator is what made `loose` useless. A `False` on an inapplicable case
+would double-count one underlying failure across several dimensions and
+destroy the breakdown's diagnostic value.
+
+`action_valid` = all *applicable* dimensions passed, per case. This is the
+hard gate: a model
 failing tier 0 at rate X will burn approximately X% of production turns,
 because these are the same signals the adequacy ledger already records live
 (`had_tool_calls`, `tool_calls_valid_json`, `finish_reason`). **Tier 0 offline
@@ -195,7 +207,7 @@ with aggregate:
 {
   "reference_model": "z-ai/glm-5.2",
   "action_valid_weighted": 0.91,
-  "by_dimension": {"acted_ok": ..., "well_formed": ..., "tool_exists": ..., "args_schema_ok": ...},
+  "by_dimension": {"acted_ok": {"rate": ..., "n_applicable": ...}, "well_formed": {...}, "tool_exists": {...}, "args_schema_ok": {...}},
   "tool_agreement": 0.61,
   "action_class_agreement": 0.78,
   "by_depth": {

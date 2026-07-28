@@ -82,34 +82,62 @@ not just a test — on mismatch. Keep the existing drift test but rename it so
 it stops claiming to be F3a; also fix its `pytest.skip`-aborts-the-loop bug
 (skip per-case via a collected list, like F1 does).
 
-### 5. Abstention scoring: honor `parsed.attempted` (verified 75, proven by direct execution)
+### 5. Dimension applicability rule: None, never False, for not-applicable (unifies former items 5, 6, 7 — owner rule, 2026-07-28)
 
-`score_replay_call` (`litmus_spec.py:599`) uses `candidate_acted =
-parsed.tool is not None`; line `:610` then forces `well_formed=True` when
-`acted_ok`. A malformed attempted call (`attempted=True, well_formed=False,
-tool=None`) against a prose reference scores `action_valid=True`. Mirror
-`score_tool_call:462`: treat `parsed.attempted` as acting — `candidate_acted
-= parsed.attempted or parsed.tool is not None` — and add the missing test
-(`ParsedCall(False, None, None, attempted=True)` vs `reference.acted=False`
-must fail `well_formed`).
+**THE RULE:** a scored dimension that is NOT APPLICABLE to a case must be
+`None`, never `False`. `False` means "checked and failed." `None` means "not
+a meaningful question here." The code already does this correctly for
+`args_schema_ok` when the named tool isn't in the capture's `tools` array —
+apply the same treatment consistently.
 
-### 6. F1 per-dimension gates (owner directive + verified 75)
+**Why it matters:** the sidecar's `by_dimension` breakdown exists for
+per-dimension fault localization. Any dimension returning `False` on an
+inapplicable case double-counts a single underlying failure across several
+dimensions and makes the breakdown useless for locating the actual fault.
 
-`test_f1_reference_self_validation` (`tests/test_f1_reference_validation.py:186-206`)
-asserts one pooled rate ≥ 0.90. Replace with per-dimension rates —
-`acted_ok`, `well_formed`, `tool_exists`, `args_schema_ok` — each asserted
-≈1.0, computed with `_rate()`-style None-exclusion, and always printed (not
-only on failure). Delete the pooled assert. Spec bullet already updated.
+**Fix site 1 — the abstention branch** (`litmus_spec.py:599`, `:610`; the
+verified-75, execution-proven bug). Use `parsed.attempted` as the
+discriminator, mirroring `score_tool_call:462`:
+- attempted a call that didn't parse → `acted_ok` per reference,
+  `well_formed=False` (meaningful — it tried and failed);
+- chose prose, never attempted → `well_formed=None` (not applicable), and
+  `tool_exists`/`args_schema_ok` likewise `None`.
+This simultaneously kills both verified defects in the branch: the malformed
+attempted call scored as a perfect abstention (`candidate_acted` must treat
+`parsed.attempted` as acting), and the reference-acted/candidate-prose case
+failing `acted_ok` AND `well_formed` for one underlying failure.
 
-### 7. closed=False dimension semantics (verified 75; prerequisite for 6)
+**Fix site 2 — the `closed=False` branch** (`litmus_spec.py:592-595`; former
+item 7). A thinking-budget overrun currently returns all-`False` across every
+dimension, registering one overrun as five distinct failures. `acted_ok=False`
+is defensible — it did not act. `well_formed`/`tool_exists`/`args_schema_ok`
+→ `None`; nothing was produced to check. Fix the "matching the existing
+profiles' treatment" comment, which is currently inaccurate.
 
-On unclosed thinking, `score_replay_call` (`litmus_spec.py:592-595`) returns
-`args_schema_ok=False` / `tool_exists=False` where `score_tool_call`
-(`:447-454`) returns `None` so `_rate` excludes uncheckable dimensions.
-Align replay with the `None` convention (keep `action_valid=False`), update
-`TestClosedGuard` (`tests/test_spec_replay.py:312-319`), and fix the
-"matching the existing profiles' treatment" comment, which is currently
-inaccurate.
+**Aggregation** (`aggregate_replay`): skip `None` rather than coercing to
+`False` when computing `by_dimension` rates, and report each dimension's
+denominator — how many cases it was actually applicable to — alongside its
+rate (e.g. `{"rate": ..., "n_applicable": ...}`). A rate over an unstated
+denominator is the thing that made `loose` useless.
+
+**F1 consumes the same semantics** (former item 6; owner directive):
+`test_f1_reference_self_validation`
+(`tests/test_f1_reference_validation.py:186-206`) drops its pooled ≥ 0.90
+assert entirely and gates each dimension separately at ≈1.0 over its
+applicable denominator, printing all four rates + denominators always, not
+only on failure. Spec bullet already updated.
+
+**Unchanged by design:** `action_valid` semantics — a case with `None`
+dimensions still fails `action_valid` if any applicable dimension failed.
+
+**Scope guard:** these two branches plus aggregation and the F1 test.
+Nothing else.
+
+**Tests:** `ParsedCall(False, None, None, attempted=True)` vs prose reference
+→ `well_formed=False`, `action_valid=False`; prose response vs acted
+reference → `acted_ok=False`, `well_formed=None`; update `TestClosedGuard`
+(`tests/test_spec_replay.py:312-319`) to the `None` shape; an aggregation
+test pinning per-dimension denominators.
 
 ## Should-fix
 
@@ -156,6 +184,7 @@ inaccurate.
    the class-filtered grouping (14 on the current corpus).
 3. Regenerated `cases/main_replay.jsonl` contains NO reference served by a
    candidate model (cross-check every case against the ledger).
-4. F1 prints four dimension rates, all ≈1.0, and fails loudly per-dimension.
+4. F1 prints four dimension rates with applicable-case denominators, all
+   ≈1.0, and fails loudly per-dimension; no pooled assert remains.
 5. Sidecar contains `action_valid_weighted`, `reference_model`, `by_chain`,
    `depth_weights` — and no pooled `action_valid`.
