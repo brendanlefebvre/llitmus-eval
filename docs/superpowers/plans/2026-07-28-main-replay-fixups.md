@@ -231,3 +231,14 @@ silent shortfalls and introduced one HIGH defect. All closed in this round:
 Remaining known gaps, deliberate: F3a backend-consumption comparison;
 strict-template (single-system-message) guard for the prompted injection —
 both noted in code/docstrings, neither blocks the increment-1 model set.
+
+8. **Live depth weights (owner directive, post-round-2)** — `_DEPTH_WEIGHTS`
+   was stale hardcoded data. The extractor now computes the observed
+   in-scope usable-pair distribution on every walk
+   (`depth_weights_from_population`), persists it (plus
+   `population_by_stratum`) in `main_replay.meta.json`, and the runner
+   consumes it via `load_replay_meta`; the 2026-07-27 constant is demoted to
+   a labeled fallback and the sidecar carries `depth_weights_source`
+   ("corpus-meta" | "fallback-2026-07-27"). Measured drift that motivated
+   this: 0.075/0.383/0.542 (07-27, 120 pairs) vs 0.129/0.397/0.473 (07-28,
+   224 pairs).

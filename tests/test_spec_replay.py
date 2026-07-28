@@ -555,6 +555,46 @@ class TestAggregateReplay:
     def test_aggregate_depth_weights_present(self):
         agg = aggregate_replay([])
         assert agg["depth_weights"] == {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
+        assert agg["depth_weights_source"] == "fallback-2026-07-27"
+
+    def test_aggregate_honors_corpus_weights(self):
+        """Explicit weights (from the extractor's meta) override the fallback,
+        and the sidecar labels the source so a stale-weights run is visible."""
+        per_case = [
+            {"action_valid": True, "acted_ok": True, "well_formed": True,
+             "tool_exists": True, "args_schema_ok": True,
+             "depth_stratum": "shallow"},
+            {"action_valid": False, "acted_ok": False, "well_formed": None,
+             "tool_exists": None, "args_schema_ok": None,
+             "depth_stratum": "deep"},
+        ]
+        weights = {"shallow": 0.1, "mid": 0.4, "deep": 0.5}
+        agg = aggregate_replay(per_case, depth_weights=weights)
+        assert agg["depth_weights"] == weights
+        assert agg["depth_weights_source"] == "corpus-meta"
+        # shallow rate 1.0 * 0.1 + deep rate 0.0 * 0.5, renormalized over 0.6
+        assert abs(agg["action_valid_weighted"] - (0.1 / 0.6)) < 1e-9
+        assert abs(agg["depth_weight_coverage"] - 0.6) < 1e-9
+
+    def test_load_replay_meta_roundtrip_and_malformed(self, tmp_path):
+        from litmus_spec import load_replay_meta
+        cases = tmp_path / "main_replay.jsonl"
+        cases.write_text("", encoding="utf-8")
+        meta = tmp_path / "main_replay.meta.json"
+        # no meta file -> None
+        assert load_replay_meta(str(cases)) is None
+        # usable weights -> meta dict returned
+        good = {"depth_weights": {"shallow": 0.2, "mid": 0.3, "deep": 0.5}}
+        meta.write_text(json.dumps(good), encoding="utf-8")
+        assert load_replay_meta(str(cases))["depth_weights"] == \
+            good["depth_weights"]
+        # malformed weights (unknown stratum key) -> None
+        meta.write_text(json.dumps(
+            {"depth_weights": {"bogus": 1.0}}), encoding="utf-8")
+        assert load_replay_meta(str(cases)) is None
+        # null weights (extractor saw no usable pairs) -> None
+        meta.write_text(json.dumps({"depth_weights": None}), encoding="utf-8")
+        assert load_replay_meta(str(cases)) is None
 
     def test_aggregate_weight_coverage_semantics(self):
         """Coverage is Σ weight over present strata; the headline renormalizes.

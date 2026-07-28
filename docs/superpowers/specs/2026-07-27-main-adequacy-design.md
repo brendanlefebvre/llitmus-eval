@@ -217,14 +217,20 @@ with aggregate:
     "deep":    {...}
   },
   "by_chain": {"chain-20260728T115606": {"action_valid": ..., "n": ...}, ...},
-  "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
+  "depth_weights": {"shallow": 0.129, "mid": 0.397, "deep": 0.473},
+  "depth_weights_source": "corpus-meta",
   "depth_weight_coverage": 1.0,
   "n_cases": 15
 }
 ```
 
-(Values illustrative; weights are the measured in-scope traffic shares
-9/46/65 over 120.) Equal-N sampling per stratum is correct for measuring the
+(Values illustrative. **Weights are computed by the extractor on every corpus
+walk** — the observed in-scope usable-pair distribution — and persisted in the
+case file's `.meta.json` sibling, which the runner consumes; the 2026-07-27
+measurement (0.075/0.383/0.542, from 9/46/65 over 120 captures) survives only
+as a fallback for case files without a meta sidecar, and
+`depth_weights_source` labels which was used so a stale-weights run is always
+visible.) Equal-N sampling per stratum is correct for measuring the
 depth *curve* — equal precision per point — but a pooled rate over an equal-N
 sample would describe a traffic mix that does not exist. So the sidecar reports
 **`action_valid_weighted`** — per-stratum rates weighted by the observed

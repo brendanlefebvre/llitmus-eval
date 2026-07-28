@@ -651,10 +651,37 @@ def score_replay_call(parsed: "ParsedCall", case: "ReplayCase",
             "action_valid": action_valid}
 
 
-_DEPTH_WEIGHTS = {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
+# Fallback only: the in-scope depth distribution measured 2026-07-27
+# (9/46/65 over 120 captures). The extractor writes the distribution it
+# actually observed into the case file's .meta.json sibling, and that is
+# what a run should use — see load_replay_meta().
+_FALLBACK_DEPTH_WEIGHTS = {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
 
 
-def aggregate_replay(per_case: list) -> dict:
+def load_replay_meta(cases_path: str) -> dict | None:
+    """Read the extractor's ``<stem>.meta.json`` sibling of a case file.
+
+    Returns the meta dict when present and its depth_weights are usable
+    (strata keys, numeric values, positive sum), else None — callers fall
+    back to _FALLBACK_DEPTH_WEIGHTS and the sidecar labels the source.
+    """
+    meta_path = os.path.splitext(cases_path)[0] + ".meta.json"
+    try:
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    weights = meta.get("depth_weights")
+    if (isinstance(weights, dict)
+            and set(weights) <= set(_FALLBACK_DEPTH_WEIGHTS)
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and v >= 0 for v in weights.values())
+            and sum(weights.values()) > 0):
+        return meta
+    return None
+
+
+def aggregate_replay(per_case: list, depth_weights: dict | None = None) -> dict:
     """Aggregate main-replay tier-0 results.
 
     `per_case` is a list of score dicts (from score_replay_call), each
@@ -693,9 +720,15 @@ def aggregate_replay(per_case: list) -> dict:
     # Weighted headline: Σ stratum_rate × depth_weight over strata with cases,
     # renormalized over the weight actually present. Coverage is reported
     # alongside so consumers can see how much of the mix the number spans.
+    if depth_weights is None:
+        weights_used = _FALLBACK_DEPTH_WEIGHTS
+        weights_source = "fallback-2026-07-27"
+    else:
+        weights_used = depth_weights
+        weights_source = "corpus-meta"
     weighted_sum = 0.0
     weight_present = 0.0
-    for stratum, weight in _DEPTH_WEIGHTS.items():
+    for stratum, weight in weights_used.items():
         d = by_depth.get(stratum) or {}
         if d.get("n", 0):
             weighted_sum += d["action_valid"] * weight
@@ -731,7 +764,8 @@ def aggregate_replay(per_case: list) -> dict:
         "by_depth": by_depth,
         "by_chain": by_chain,
         "reference_model": reference_model,
-        "depth_weights": dict(_DEPTH_WEIGHTS),
+        "depth_weights": dict(weights_used),
+        "depth_weights_source": weights_source,
         "n_cases": n_cases,
     }
 
@@ -948,7 +982,7 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool,
 
 
 def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
-                    enable_thinking=None) -> dict:
+                    enable_thinking=None, depth_weights: dict | None = None) -> dict:
     """Replay captured LLM request bodies through a local model and score tier-0.
 
     The prompt is the captured request body verbatim by reference: the runner
@@ -1021,7 +1055,8 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
         if tokens_fed_error is not None:
             rec["tokens_fed_error"] = tokens_fed_error
         records.append(rec)
-    return {"aggregate": aggregate_replay(per_case_scores),
+    return {"aggregate": aggregate_replay(per_case_scores,
+                                          depth_weights=depth_weights),
             "cases": records, "errored": errored}
 
 
@@ -1232,6 +1267,15 @@ def main() -> None:
                             or THINKING_MAX_TOKENS[args.profile])
     cases = load_cases(cases_path, args.profile)   # fail-fast before loading a model
     print(f"loaded {len(cases)} cases from {cases_path}")
+    replay_weights = None
+    if args.profile == "main-replay":
+        replay_meta = load_replay_meta(cases_path)
+        if replay_meta is not None:
+            replay_weights = replay_meta["depth_weights"]
+            print(f"depth weights from corpus meta: {replay_weights}")
+        else:
+            print("no usable .meta.json beside case file — using fallback "
+                  f"depth weights {_FALLBACK_DEPTH_WEIGHTS} (measured 2026-07-27)")
 
     backend = get_backend(args.backend)
     for label, repo in _targets_for(args):
@@ -1295,7 +1339,8 @@ def main() -> None:
                 print(format_constraint_table(f"{label} [{mode}]", result))
             elif args.profile == "main-replay":
                 result = run_main_replay(cases, tokenizer, gen, native=native,
-                                         enable_thinking=flag)
+                                         enable_thinking=flag,
+                                         depth_weights=replay_weights)
                 print(format_replay_table(f"{label} [{mode}]", result))
             else:
                 result = run_tool_calling(cases, tokenizer, gen, native=native,

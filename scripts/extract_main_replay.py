@@ -552,9 +552,23 @@ def sample_cases(usable: list[dict],
 # Corpus snapshot metadata
 # ---------------------------------------------------------------------------
 
+def depth_weights_from_population(pop_by_stratum: dict) -> dict | None:
+    """In-scope depth weights observed on THIS corpus walk.
+
+    weight_s = usable pairs in stratum s / total usable in-scope pairs.
+    This is what aggregate_replay should weight by — the hardcoded constant
+    in litmus_spec is only a fallback from the 2026-07-27 measurement, and
+    the corpus has grown since. None when there are no usable pairs.
+    """
+    total = sum(pop_by_stratum.get(s, 0) for s in STRATA)
+    if not total:
+        return None
+    return {s: pop_by_stratum.get(s, 0) / total for s in STRATA}
+
+
 def write_meta(output_path: pathlib.Path, corpus_count: int,
                newest_name: str, final_cases: list[dict],
-               coverage: dict) -> pathlib.Path:
+               coverage: dict, pop_by_stratum: dict) -> pathlib.Path:
     """Persist the corpus snapshot as a sibling ``<stem>.meta.json``.
 
     The captures dir grows over time; the stdout snapshot line alone leaves
@@ -566,6 +580,9 @@ def write_meta(output_path: pathlib.Path, corpus_count: int,
         "newest_capture": newest_name,
         "n_cases": len(final_cases),
         "strata": {s: coverage.get(s, {}).get("n", 0) for s in STRATA},
+        "population_by_stratum": {s: pop_by_stratum.get(s, 0)
+                                  for s in STRATA},
+        "depth_weights": depth_weights_from_population(pop_by_stratum),
         "chains_represented": sorted(
             set(c["chain_id"] for c in final_cases)),
     }
@@ -706,7 +723,11 @@ def main() -> None:
             print(f"  NOTE: two-chain coverage only in: {', '.join(multi)}")
         print(f"  SINGLE-CHAIN strata: {', '.join(single)}")
     meta_path = write_meta(output_path, corpus_count, newest_name,
-                           final_cases, coverage)
+                           final_cases, coverage, pop_by_stratum)
+    weights = depth_weights_from_population(pop_by_stratum)
+    if weights:
+        print("Observed depth weights (usable in-scope pairs): "
+              + ", ".join(f"{s}={weights[s]:.3f}" for s in STRATA))
     print(f"\nWrote {len(final_cases)} cases to {output_path}")
     print(f"Wrote corpus snapshot metadata to {meta_path}")
 

@@ -935,8 +935,9 @@ class TestCorpusMeta:
         sample, coverage = emr.sample_cases(usable, 5)
 
         output_path = tmp_path / "cases" / "main_replay.jsonl"
+        pop = {"shallow": 1, "mid": 0, "deep": 0}
         meta_path = emr.write_meta(
-            output_path, len(rows), rows[-1]["name"], sample, coverage)
+            output_path, len(rows), rows[-1]["name"], sample, coverage, pop)
 
         assert meta_path == tmp_path / "cases" / "main_replay.meta.json"
         assert meta_path.exists()
@@ -946,4 +947,15 @@ class TestCorpusMeta:
             "req-20260101T000001.000000-0001.json"
         assert meta["n_cases"] == 1
         assert meta["strata"] == {"shallow": 1, "mid": 0, "deep": 0}
+        assert meta["population_by_stratum"] == pop
+        assert meta["depth_weights"] == {"shallow": 1.0, "mid": 0.0,
+                                         "deep": 0.0}
         assert meta["chains_represented"] == ["chain-20260101T000000"]
+
+    def test_depth_weights_from_population(self):
+        w = emr.depth_weights_from_population(
+            {"shallow": 29, "mid": 89, "deep": 106})
+        assert abs(sum(w.values()) - 1.0) < 1e-9
+        assert abs(w["deep"] - 106 / 224) < 1e-9
+        assert emr.depth_weights_from_population(
+            {"shallow": 0, "mid": 0, "deep": 0}) is None
