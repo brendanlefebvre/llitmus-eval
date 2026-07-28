@@ -1,8 +1,12 @@
 # What "adequacy" means for the `main` class: next-action replay against captured trajectories
 
-**Status:** Proposed — design only, no implementation. A recommendation to argue with.
-**Date:** 2026-07-27
-**Inputs:** 137 captures (129 `main`) in `~/.local/state/loxo-llm-router/captures/`, the Litmus tool-calling profile, the Loxo adequacy ledger, learnings entries of 2026-07-27.
+**Status:** Proposed — design only, no implementation. Revised 2026-07-28 per
+measurement review (chain structure, authoritative depth profile, reference-set
+identity, weighting, F3 split, confound). A recommendation to argue with.
+**Date:** 2026-07-27, revised 2026-07-28
+**Inputs:** 137 captures (129 `main`) in `~/.local/state/loxo-llm-router/captures/`,
+the Litmus tool-calling profile, the Loxo adequacy ledger, learnings entries of
+2026-07-27 (including the authoritative depth-profile entry).
 
 ## The question
 
@@ -16,27 +20,38 @@ proposes a definition of per-model `main` adequacy that a router can look up.
 ## The empirical fact the whole design rests on
 
 The captures are not 129 independent request bodies. They are **successive
-snapshots of the same growing conversations**: the dominant group is one
-OpenCode session of 126 requests whose message arrays grow monotonically from 12
-to 274 messages, and each capture's messages are a byte-identical prefix of the
-next (verified by per-message SHA1 comparison during exploration).
+snapshots of growing conversations** — verified by hashing each message and
+comparing overlaps. Measured structure (2026-07-28): **eleven prefix chains**,
+not one. The dominant chain is **115 captures** (13:39→15:22) yielding **114 of
+the 126 usable pairs**; the rest are one chain of 8, two of 3, one of 2, and
+six singletons (curl probes, session-start title generations, a replay).
 
 Consequence: **capture N ends exactly where a model had to act, and capture N+1
-contains what the incumbent production model actually did** — the appended
-assistant message, with its real tool calls and arguments. The corpus is
-therefore ~125 (state, known-good-action) pairs from real work, at context
-depths from 12k to 90k real prompt tokens, with the client's verbatim
-parameters and all 11 tool schemas. That is a replay evaluation set that no
-synthetic benchmark can reproduce, and it is the asset the brief says is
+contains what the serving model actually did** — the appended assistant
+message, with its real tool calls and arguments. A pair is usable only when the
+appended messages begin with an `assistant` message; appends that are
+`tool`/`user` only are not decision points and are skipped. The corpus is
+therefore 126 (state, known-good-action) pairs from real work — fewer after
+the skip rules in the first-increment section — with the
+client's verbatim parameters and all 11 tool schemas — a replay evaluation set
+no synthetic benchmark can reproduce, and the asset the brief calls
 irreplaceable.
+
+Two honesty notes on this corpus, expanded in the limits section: **114 of the
+126 pairs come from one session about one task** (Litmus chore-profile work, in
+Python, in this repo), and the reference actions are overwhelmingly one
+model's: the ledger attributes **126 `main` turns to `z-ai/glm-5.2` and 3 to
+`mlx-community/Qwen3-14B-4bit`**. The reference set is glm-5.2, and the doc
+says "glm-5.2" rather than "the incumbent" wherever the distinction pays rent.
 
 ## The proposed definition
 
 > **A model is adequate for `main` to the extent that, when dropped verbatim
 > into real mid-session states from captured traffic, it (a) produces a
-> mechanically valid next action, and (b) chooses the same kind of action the
-> incumbent model actually took at that same point — with both rates reported
-> per context-depth stratum, alongside latency and peak memory.**
+> mechanically valid next action, and (b) chooses the same kind of action
+> glm-5.2 — the model that actually served these turns — took at that same
+> point, with both rates reported per context-depth stratum, alongside latency
+> and peak memory.**
 
 The unit of evaluation is the **turn**, not the session. This is partly forced
 (a session-level eval needs an execution environment; see rejected alternative
@@ -67,14 +82,13 @@ Pure validators in the existing `litmus_spec.py` style, no judgment:
 - Thinking-budget guard: an unclosed `<think>` scores all-false, as in the
   existing profiles.
 
-`action_valid` = all of the above per case, aggregated as a rate. This is the
-hard gate: a model failing tier 0 at rate X will burn approximately X% of
-production turns, because these are the same signals the adequacy ledger
-already records live (`had_tool_calls`, `tool_calls_valid_json`,
-`finish_reason`). **Tier 0 offline is the prior; the ledger is the posterior of
-the identical statistic.** That symmetry is deliberate: when a model is ever
-promoted, the bench number and the production number are directly comparable
-with no translation.
+`action_valid` = all of the above per case. This is the hard gate: a model
+failing tier 0 at rate X will burn approximately X% of production turns,
+because these are the same signals the adequacy ledger already records live
+(`had_tool_calls`, `tool_calls_valid_json`, `finish_reason`). **Tier 0 offline
+is the prior; the ledger is the posterior of the identical statistic.** That
+symmetry is deliberate: when a model is ever promoted, the bench number and the
+production number are directly comparable with no translation.
 
 ### Tier 1 — reference agreement (the ranking signal, not a gate)
 
@@ -83,6 +97,11 @@ with no translation.
 - `action_class_match` — agreement at a coarse partition: *gather*
   (read/grep/glob/webfetch) | *mutate* (edit/write/bash) | *orchestrate*
   (todowrite/task/skill/question) | *respond* (no tool).
+
+**"Agreement" here means agreement with glm-5.2 specifically** — the model that
+served 126 of the 129 captured `main` turns — not with an abstract authority.
+The sidecar records `reference_model` so the number can never be read as more
+than that.
 
 This is where the multiple-valid-actions problem lives: `read foo.py` and
 `grep -n symbol` can both be right, so per-case disagreement is not per-case
@@ -111,22 +130,50 @@ verbosity, and self-enhancement bias; verified 2026-07-27):
 - Binary defensibility of a *tool call* → verbosity bias has little surface.
 - The judge never scores its own outputs → self-enhancement bias is absent.
 - Judge-stronger-than-judged is acceptable *here* because the judge is not
-  defining quality; the captured incumbent already did. The judge only
-  estimates how often "different from the incumbent" means "wrong."
+  defining quality; the captured glm-5.2 actions already did. The judge only
+  estimates how often "different from glm-5.2" means "wrong."
 - Non-determinism and cost are bounded because the judge output is a
   calibration constant, not a per-model score. If the judge is dropped
   entirely, tiers 0–1 still function; the routing number never depends on it.
 
 ### Depth stratification
 
-Every rate above is reported per prompt-size stratum: **shallow** (<16k
-estimated tokens), **mid** (16–40k), **deep** (40k up to the local context
-limit). Beyond the limit, Rule 3 already routes to cloud, so it is out of
-scope. Rationale: for local candidates the routing-relevant failure mode is
-precisely "at what depth does this model stop being able to act." A single
-pooled number would average away the cliff; the stratified curve *is* the
-signal that separates "can carry a coding session" from "cannot," because
-carrying a session means still acting correctly at turn 200, not just turn 2.
+Every rate above is reported per prompt-size stratum. Strata and their measured
+population — computed with **Loxo's own `estimate_prompt_tokens()` imported
+from the package and the deployment's real `LOCAL_CONTEXT_LIMIT = 60000`**,
+never a reimplementation or a char-count proxy (a naive proxy inverted the
+strategic conclusion before being caught; see the 2026-07-27 depth-profile
+learning) — over the 137 captures:
+
+| stratum | est. tokens | n | share |
+|---|---|---|---|
+| shallow | <16k | 9 | 6.6% |
+| mid | 16k–40k | 46 | 33.6% |
+| deep (in scope) | 40k–60k | 65 | 47.4% |
+| over limit (Rule 3 → cloud) | >60k | 17 | 12.4% |
+
+p50 43,515 · p90 60,610 · max 64,644. The ~5.6k-token tool-schema floor on
+every request means genuinely shallow `main` traffic barely exists — **shallow
+is the binding stratum at n=9**, and any equal-N sample takes most of its
+population. Beyond the limit, Rule 3 already routes to cloud, so >60k is out of
+scope; only 12.4% of traffic exits that way, leaving ~88% of `main` genuinely
+eligible for an adequacy decision — the eval's addressable share is large. One
+marginal note: the distribution is pressed against the limit (p90 60,610 vs a
+60,000 ceiling), so `local_context_limit` is the binding constraint at the
+margin and longer sessions cross it routinely — worth a config experiment,
+not a reframe.
+
+Cases are stratified **by chain as well as depth**: with 114 of 126 pairs
+coming from one session, a depth-only sample is silently also a
+one-task sample. The first increment draws from at least two chains (the
+8-capture chain is a different task) and records chain identity per case.
+
+Rationale for the depth axis is unchanged: for local candidates the
+routing-relevant failure mode is "at what depth does this model stop being able
+to act." A single pooled number would average away the cliff; the stratified
+curve *is* the signal that separates "can carry a coding session" from
+"cannot" — subject to the depth/session-progress confound stated in the limits
+section.
 
 ## The number the router reads
 
@@ -136,7 +183,8 @@ with aggregate:
 
 ```json
 {
-  "action_valid": 0.93,
+  "reference_model": "z-ai/glm-5.2",
+  "action_valid_weighted": 0.91,
   "by_dimension": {"acted_ok": ..., "well_formed": ..., "tool_exists": ..., "args_schema_ok": ...},
   "tool_agreement": 0.61,
   "action_class_agreement": 0.78,
@@ -145,16 +193,26 @@ with aggregate:
     "mid":     {...},
     "deep":    {...}
   },
+  "by_chain": {"chain-01": {"action_valid": ..., "n": ...}, "chain-10": {...}},
+  "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
   "n_cases": 15
 }
 ```
 
-(Values illustrative.) The eventual `adequacy_scores.json` entry for
-`class=main` is `{model, action_valid, tool_agreement, by_depth}` plus the cost
-axes — two-axis adequacy, exactly as the chore work concluded (a model that
-passes every check at 125 s is still the wrong route). Promotion stays human
-per the ROADMAP non-goal; this number narrows candidates, it does not flip
-switches.
+(Values illustrative; weights are the measured in-scope traffic shares
+9/46/65 over 120.) Equal-N sampling per stratum is correct for measuring the
+depth *curve* — equal precision per point — but a pooled rate over an equal-N
+sample would describe a traffic mix that does not exist. So the sidecar reports
+**`action_valid_weighted`** — per-stratum rates weighted by the observed
+in-scope depth distribution — and **no unweighted pooled number exists in the
+sidecar at all**.
+
+The eventual `adequacy_scores.json` entry for `class=main` is `{model,
+reference_model, action_valid_weighted, tool_agreement, by_depth}` plus the
+cost axes — two-axis adequacy, exactly as the chore work concluded (a model
+that passes every check at 125 s is still the wrong route). Promotion stays
+human per the ROADMAP non-goal; this number narrows candidates, it does not
+flip switches.
 
 ## Rejected alternatives
 
@@ -206,8 +264,8 @@ or failure-to-act at all.
 ## Falsification tests (built into the first increment)
 
 - **F1 — reference self-validation.** Run the tier-0 validators over the
-  *reference actions themselves*. They are real production actions from the
-  incumbent; they must pass ≈100%. Any systematic failure means the harness is
+  *reference actions themselves*. They are real production actions from
+  glm-5.2; they must pass ≈100%. Any systematic failure means the harness is
   measuring itself, not the model (the `parse_native` failure mode). Hard stop
   until fixed.
 - **F2 — known-good/known-bad separation.** Llama-3.2-1B vs Qwen3-14B on
@@ -217,41 +275,78 @@ or failure-to-act at all.
   the gate is falsified. Expected result: the 1B collapses; if it does not,
   this design is wrong and the honest conclusion is that mechanical validity
   does not separate models on this class.
-- **F3 — depth-curve direction.** For small models, `action_valid` must be
-  non-increasing across shallow→mid→deep. An inversion indicates a harness
-  artifact (truncation, parsing, template overflow), not capability — the
-  tight-token-budget lesson in new clothes.
+- **F3a — no truncation (hard gate, checked directly).** For every case,
+  compare the tokenizer's count of the prompt actually fed to the model against
+  the case's expected length. Any mismatch is a harness bug (truncation,
+  template overflow) — the tight-token-budget lesson in new clothes — and is
+  caught by measurement, not inferred from a score curve.
+- **F3b — depth-curve direction (observation, not pass/fail).** Report the
+  `action_valid` curve across shallow→mid→deep per model and account for its
+  direction. A non-increasing curve for small models is the expected shape, but
+  an inversion is a *finding to explain*, not an automatic failure: deep turns
+  in this corpus may genuinely be easier (late-session work is often
+  follow-through — read this file, apply that edit — while early turns are
+  open-ended), and with 114/126 pairs from one session, depth and
+  session-progress are nearly the same variable. Note also that at n=5 per
+  stratum a single case moves a rate by 0.20, so no strict monotonicity
+  assertion is falsifiable at this sample size; F3b is reported, discussed, and
+  used to direct the next increment's sampling — nothing more.
 - **F4 — agreement noise floor** (second increment). The strongest local
   model's `tool_agreement` bounds what agreement can mean on this case set. If
-  the strongest model agrees with the reference on, say, <40% of turns while
-  holding high `action_valid`, then tier 1 is too noisy at current case counts
-  to rank with, and must be recalibrated (coarser classes, more cases, or tier-2
+  the strongest model agrees with glm-5.2 on, say, <40% of turns while holding
+  high `action_valid`, then tier 1 is too noisy at current case counts to rank
+  with, and must be recalibrated (coarser classes, more cases, or tier-2
   calibration) before the router reads it.
 
 ## First increment (one day), and what would kill it
 
 1. **Extractor** — `scripts/extract_main_replay.py`: walk the captures dir,
-   group files into sessions by message-prefix matching, and for each selected
-   turn emit a case: `{id, capture_path, depth_stratum, reference: {acted,
-   tools: [...], arguments: {...}}}` to `cases/main_replay.jsonl`. The prompt
-   is **the captured body verbatim by reference** (path, not embedded copy):
-   fixture fidelity is structural — `max_tokens: 32000`, `tool_choice`,
-   the full tool array, everything, because the case *is* the request. This
-   avoids yesterday's half-real-fixture bug by construction, and keeps 460 KB
-   bodies (and operator content) out of the repo; the runner reads
-   `LOXO_CAPTURE_DIR`. Skip pathological reference turns (reasoning-only, no
-   content or tool call). Sample: 5 shallow / 5 mid / 5 deep = 15 cases.
+   group files into prefix chains by per-message hashing, and for each selected
+   turn emit a case: `{id, capture_path, chain_id, depth_stratum, reference:
+   {acted, tools: [...], arguments: {...}}}` to `cases/main_replay.jsonl`.
+   Stratum assignment uses `from loxo_llm_router import estimate_prompt_tokens`
+   and the deployment's configured `LOCAL_CONTEXT_LIMIT` — imported, never
+   reimplemented. The prompt is **the captured body verbatim by reference**
+   (path, not embedded copy): fixture fidelity is structural —
+   `max_tokens: 32000`, `tool_choice`, the full tool array, everything, because
+   the case *is* the request. This avoids the half-real-fixture bug by
+   construction, and keeps 460 KB bodies (and operator content) out of the
+   repo; the runner reads `LOXO_CAPTURE_DIR`.
+
+   **Skip rules** (each logged with a reason, never silently dropped):
+   - non-`main` captures (class recomputed via `classify()`);
+   - pairs whose appended messages do not begin with an `assistant` message
+     (not a decision point);
+   - pathological reference turns (reasoning-only, no content or tool call);
+   - **the 3 turns served locally by Qwen3-14B** (per the ledger,
+     correlated by timestamp) — Qwen3-14B is a candidate in this increment and
+     must not be scored against references it authored;
+   - the zero/near-zero-token curl probes
+     (`req-20260727T121220.315928-0000.json` and
+     `req-20260727T121227.015255-0001.json` estimate exactly 0; two more
+     probes estimate 5–6). These classify as `unknown`, so the class filter
+     already excludes them, but the skip list names them explicitly rather
+     than relying on that coincidence.
+
+   **Sample: 15 cases, 5 per stratum, drawn from at least two chains** (the
+   dominant 115-capture chain plus the 8-capture chain, which is a different
+   task). Fifteen cases from two tasks is materially better evidence than
+   fifteen from one at identical runtime. Stated plainly: the shallow stratum's
+   population is only 9, so its sample of 5 covers most of what exists; and
+   equal-N is a curve-measuring choice, corrected at reporting time by the
+   depth weights above.
 2. **Profile** — `main-replay` in `litmus_spec.py`: loader + runner reusing
    the native/prompted machinery; tier-0 checks only.
 3. **Run** Llama-3.2-1B, Qwen3-4B (think + no-think), Qwen3-14B (think +
    no-think). Sidecars out.
-4. **Execute F1–F3 and report raw outputs alongside scores** (yesterday's rule:
-   read the outputs, not just the number).
+4. **Execute F1, F2, F3a; report F3b; report raw outputs alongside scores**
+   (the standing rule: read the outputs, not just the number).
 
-Kill criteria for the day: F1 fails (validators can't validate real incumbent
-actions) or F2 fails (no separation). Either result falsifies the approach
-before any router integration exists — which is the point of building this
-increment first.
+Kill criteria for the day: F1 fails (validators can't validate real glm-5.2
+actions), F2 fails (no separation), or F3a fails (prompts truncated — fix the
+harness before believing anything). Any of these falsifies the approach before
+any router integration exists — which is the point of building this increment
+first.
 
 Deliberate parameter decision: generation runs with the captured
 `max_tokens=32000`, not a tight action budget. A tight cap silently zeroes out
@@ -260,29 +355,34 @@ thinking models (2026-07-16 lesson); a runaway thinker under the honest cap is
 title was.
 
 Deferred to increment 2+: tier 1 agreement + F4; tier 2 judge calibration;
-prompt-cache reuse across same-session cases (cases from one session share long
+prompt-cache reuse across same-chain cases (cases from one chain share long
 byte-identical prefixes — the natural lever if prefill cost grows); the
 `adequacy_scores.json` exporter; sharing the scorer with Loxo A4 shadow
 evaluation.
 
 ## Cost estimate (honest)
 
-Prefill dominates: deep cases are 40–90k real prompt tokens. Per-case decode is
-small (an action is tens of tokens, plus thinking where enabled). Prefill
-throughput for these exact shapes is **unmeasured** — `litmus.py
-prefill-scaling` exists and should produce the number before anyone quotes one.
-Order-of-magnitude expectation: minutes per deep case on the 14B, so a full
-15-case × 2-mode run plausibly lands in the tens-of-minutes-to-low-hours range
-per large model; the 1B is trivial. If that proves too slow to re-run per model
-release, the prompt-cache-reuse lever above is the mitigation, and the honest
-fallback is fewer deep cases (with the coverage loss stated in the sidecar, not
-silently).
+Prefill dominates, and the measured distribution says the *typical* case is
+big: p50 ≈ 43.5k estimated prompt tokens, with the deep stratum (47% of
+in-scope traffic) running 40–60k. Per-case decode is small (an action is tens
+of tokens, plus thinking where enabled). Prefill throughput for these exact
+shapes is **unmeasured** — `litmus.py prefill-scaling` exists and should
+produce the number before anyone quotes one. Order-of-magnitude expectation:
+minutes per deep case on the 14B, so a full 15-case × 2-mode run plausibly
+lands in the tens-of-minutes-to-low-hours range per large model; the 1B is
+trivial. Because the corpus is deep-heavy, same-chain prompt-cache reuse is
+**load-bearing for re-runnability, not a nice-to-have** — cases from one chain
+share byte-identical prefixes by construction. Deep cases are the last thing to
+cut: they are where the routing decision actually lives. If the runtime still
+proves too slow per model release, the honest fallback is fewer *shallow* cases
+(a stratum with population 9 anyway), with the coverage change stated in the
+sidecar, not silently.
 
 ## What this does NOT measure
 
 - **Compounding error and self-recovery — the structural gap.** Replay scores
-  every candidate on the *incumbent's* state distribution. A candidate's own
-  mistakes would take a real session somewhere these captures never go, and
+  every candidate on the *reference model's* state distribution. A candidate's
+  own mistakes would take a real session somewhere these captures never go, and
   nothing here measures whether it recovers. This is the covariate-shift
   critique of behavioral cloning (Ross, Gordon & Bagnell, AISTATS 2011 —
   DAgger; arXiv:1011.0686, cited from training knowledge, not re-checked
@@ -290,6 +390,21 @@ silently).
   method short of rejected alternative 1 closes this; the sufficiency proof is
   and remains production shadow evaluation and earned promotion (A4/A6/A7).
   **This eval is the filter, not the verdict.**
+- **One session, one task, one codebase.** 114 of 126 usable pairs come from a
+  single session doing a single task (Litmus chore-profile work — Python, in an
+  eval harness, in this repo). "One day of one operator's traffic" would
+  understate it. A model could score well by being good at Python eval-harness
+  work specifically; two-chain sampling mitigates at the margin, and only
+  accumulating more capture days fixes it.
+- **Depth vs session-progress is confounded — a property of this data, not a
+  fixable flaw in the method.** Because nearly all pairs are one session,
+  "deeper context" and "later in one task" are nearly the same variable. The
+  depth curve cannot cleanly attribute degradation to context length until the
+  corpus contains deep turns from multiple sessions. F3b treats curve shape as
+  an observation partly for this reason.
+- **glm-5.2 is the reference, not the truth.** Tier 1 measures
+  glm-5.2-likeness. Where glm-5.2 chose a suboptimal action, agreeing with it
+  scores as agreement all the same.
 - **Edit and code quality.** `args_schema_ok` does not mean the edit compiles,
   the bash command is safe, or the code is right. Nothing executes.
 - **Prose-turn quality.** When the right move is to answer the user in text,
