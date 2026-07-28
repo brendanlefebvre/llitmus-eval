@@ -216,8 +216,9 @@ with aggregate:
     "mid":     {...},
     "deep":    {...}
   },
-  "by_chain": {"chain-01": {"action_valid": ..., "n": ...}, "chain-10": {...}},
+  "by_chain": {"chain-20260728T115606": {"action_valid": ..., "n": ...}, ...},
   "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
+  "depth_weight_coverage": 1.0,
   "n_cases": 15
 }
 ```
@@ -229,6 +230,16 @@ sample would describe a traffic mix that does not exist. So the sidecar reports
 **`action_valid_weighted`** — per-stratum rates weighted by the observed
 in-scope depth distribution — and **no unweighted pooled number exists in the
 sidecar at all**.
+
+**Renormalization rule (2026-07-28):** when a stratum contributes zero scored
+cases (e.g. every deep case errored), its weight is not silently dropped —
+that would make "all deep cases crashed" indistinguishable from "all deep
+cases failed." The weighted rate renormalizes over the strata actually
+present, and **`depth_weight_coverage`** (Σ weights of present strata; 1.0
+when all three report) is published beside it so a shrunken evidence base is
+visible, never implicit. Chain ids are derived from the first capture's
+timestamp stem, not enumeration order, so `by_chain` is comparable across
+extractions.
 
 The eventual `adequacy_scores.json` entry for `class=main` is `{model,
 reference_model, action_valid_weighted, tool_agreement, by_depth}` plus the

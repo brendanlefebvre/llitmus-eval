@@ -6,7 +6,7 @@ the replay cases were extracted from. Any systematic failure means the harness
 is measuring itself, not the model (the ``parse_native`` failure mode). That
 is a hard stop until fixed.
 
-Also includes F3a: a check that each case's ``est_tokens`` matches
+Also includes an est_tokens drift check: each case's ``est_tokens`` must match
 ``estimate_prompt_tokens`` on the capture body, catching extraction drift.
 
 These are integration tests. They require ``cases/main_replay.jsonl`` to exist
@@ -31,6 +31,7 @@ if str(_SCRIPTS) not in sys.path:
 
 from litmus_spec import (  # noqa: E402
     ParsedCall,
+    ReplayCase,
     load_cases,
     score_replay_call,
 )
@@ -98,19 +99,20 @@ def _find_capture_n1(capture_path: str) -> tuple[dict, str] | None:
     return None
 
 
-def _reference_parsed_call(n1_body: dict, n_count: int) -> ParsedCall:
-    """Build a ParsedCall from the reference assistant message in capture N+1.
+def _reference_parsed_calls(n1_body: dict, n_count: int) -> list[ParsedCall]:
+    """Build one ParsedCall per action in the reference assistant message.
 
-    The reference action is the first ``assistant`` message in the appended
-    messages (beyond capture N's count). Per the brief:
+    The reference turn is the first ``assistant`` message in the appended
+    messages (beyond capture N's count). EVERY call in a parallel-call turn is
+    returned — the caller scores each as its own row, so a reference turn
+    passes a dimension only if all its calls pass.
 
-    - tool_calls present: ParsedCall(well_formed=True, tool=<first call's
-      function.name>, arguments=json.loads(<first call's function.arguments>),
-      detail="reference", attempted=True). Tier-0 checks the first action only,
-      same as the candidate evaluation.
-    - no tool_calls but content (prose): ParsedCall(well_formed=True, tool=None,
-      arguments=None, detail="reference prose", attempted=False) — a correct
-      abstention.
+    - tool_calls present: one ParsedCall(well_formed=True, tool=<the call's
+      function.name>, arguments=<parsed function.arguments>,
+      detail="reference", attempted=True) per call, in order.
+    - no tool_calls but content (prose): a single ParsedCall(well_formed=True,
+      tool=None, arguments=None, detail="reference prose", attempted=False) —
+      a correct abstention.
     - neither: the pathological case the extractor should have skipped. We
       raise so the test surfaces it rather than silently passing.
     """
@@ -121,21 +123,25 @@ def _reference_parsed_call(n1_body: dict, n_count: int) -> ParsedCall:
             f"no appended assistant message found (n_count={n_count})")
     tool_calls = ref_msg.get("tool_calls")
     if tool_calls:
-        fn = tool_calls[0].get("function", {})
-        name = fn.get("name")
-        args_raw = fn.get("arguments", "{}")
-        if isinstance(args_raw, str):
-            args = json.loads(args_raw)
-        elif isinstance(args_raw, dict):
-            args = args_raw
-        else:
-            args = {}
-        return ParsedCall(well_formed=True, tool=name, arguments=args,
-                          detail="reference", attempted=True)
+        calls = []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name")
+            args_raw = fn.get("arguments", "{}")
+            if isinstance(args_raw, str):
+                args = json.loads(args_raw)
+            elif isinstance(args_raw, dict):
+                args = args_raw
+            else:
+                args = {}
+            calls.append(ParsedCall(well_formed=True, tool=name,
+                                    arguments=args, detail="reference",
+                                    attempted=True))
+        return calls
     content = ref_msg.get("content")
     if content:
-        return ParsedCall(well_formed=True, tool=None, arguments=None,
-                          detail="reference prose", attempted=False)
+        return [ParsedCall(well_formed=True, tool=None, arguments=None,
+                           detail="reference prose", attempted=False)]
     raise AssertionError(
         "pathological reference (no tool_calls, no content) — extractor should "
         "have skipped this pair")
@@ -154,9 +160,11 @@ def test_f1_reference_self_validation():
     """F1: tier-0 validators must pass ~100% on real glm-5.2 reference actions.
 
     Gated per dimension (acted_ok, well_formed, tool_exists, args_schema_ok),
-    each at ≈1.0 over its applicable-case denominator. Uncheckable dimensions
-    (None) are excluded from denominators. The diagnostic value of F1 is
-    *which* dimension fails, so a pooled rate is never used.
+    each at ≈1.0 over its applicable-row denominator — every call in a
+    parallel-call reference turn is its own row (ids suffixed "#2", "#3", …).
+    Uncheckable dimensions (None) are excluded from denominators. The
+    diagnostic value of F1 is *which* dimension fails, so a pooled rate is
+    never used.
     """
     cases = _require_cases()
 
@@ -173,14 +181,18 @@ def test_f1_reference_self_validation():
         n1_body, _ = pair
         n_count = len(_load_capture(case.capture_path).get("messages") or [])
         try:
-            ref_parsed = _reference_parsed_call(n1_body, n_count)
+            ref_calls = _reference_parsed_calls(n1_body, n_count)
         except AssertionError:
             skipped.append(case.id)
             continue
         capture_tools = _capture_tools(case.capture_path)
-        score = score_replay_call(ref_parsed, case, capture_tools, closed=True)
-        score["id"] = case.id
-        results.append(score)
+        # One row per reference call: a parallel-call turn passes a dimension
+        # only if every call passes. Rows past the first get an id suffix.
+        for i, ref_parsed in enumerate(ref_calls):
+            score = score_replay_call(ref_parsed, case, capture_tools,
+                                      closed=True)
+            score["id"] = case.id if i == 0 else f"{case.id}#{i + 1}"
+            results.append(score)
 
     if not results:
         pytest.skip("no reference actions could be resolved from captures")
@@ -222,6 +234,43 @@ def test_f1_reference_self_validation():
     )
 
 
+def test_reference_parsed_calls_validates_all_parallel_calls():
+    """Every call in a parallel-call reference turn is built and scorable.
+
+    Unit test (no captures needed): a two-call reference where the second
+    call names a tool absent from the capture's tools — the second row must
+    fail tool_exists, so the turn cannot pass on the strength of its first
+    call alone.
+    """
+    n1_body = {"messages": [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"function": {"name": "read", "arguments": '{"filePath": "x"}'}},
+            {"function": {"name": "bogus_tool", "arguments": "{}"}},
+        ]},
+    ]}
+    calls = _reference_parsed_calls(n1_body, n_count=1)
+    assert len(calls) == 2
+    assert [c.tool for c in calls] == ["read", "bogus_tool"]
+
+    case = ReplayCase(
+        id="t-parallel", capture_path="unused", chain_id="c-1",
+        depth_stratum="mid", est_tokens=1,
+        reference={"acted": True, "tools": ["read"], "arguments": []})
+    capture_tools = [{"type": "function", "function": {
+        "name": "read",
+        "parameters": {"type": "object",
+                       "properties": {"filePath": {"type": "string"}},
+                       "required": ["filePath"]},
+    }}]
+    scores = [score_replay_call(c, case, capture_tools, closed=True)
+              for c in calls]
+    assert scores[0]["tool_exists"] is True
+    assert scores[0]["action_valid"] is True
+    assert scores[1]["tool_exists"] is False
+    assert scores[1]["action_valid"] is False
+
+
 # ---------------------------------------------------------------------------
 # est_tokens drift check (formerly mislabelled "F3a")
 # ---------------------------------------------------------------------------
@@ -230,13 +279,16 @@ def test_est_tokens_drift_check():
     """est_tokens drift check: each case's est_tokens must match
     estimate_prompt_tokens(capture body).
 
-    This is NOT the F3a truncation gate — that lives in run_main_replay as the
-    per-case ``prompt_tokens_fed`` recording, which compares the tokenizer's
-    count of the *rendered* prompt against what the model actually consumed.
-    This test instead catches extraction drift: if the tokenizer's count of the
-    captured prompt no longer matches what the extractor recorded, the case's
-    depth stratum may be wrong. Estimator-vs-itself can't detect truncation,
-    but it can detect a stale case file.
+    This is NOT the F3a truncation gate — what exists of that lives in
+    run_main_replay: per-case ``prompt_tokens_fed`` recording (the tokenizer's
+    count of the *rendered* prompt), a ``tokens_fed_error`` note when the
+    tokenizer fails, and an overflow gate that errors any case whose rendered
+    prompt exceeds a sane tokenizer ``model_max_length``. Comparison against
+    what the backend *actually consumed* remains future work. This test
+    instead catches extraction drift: if the estimator's count of the captured
+    prompt no longer matches what the extractor recorded, the case's depth
+    stratum may be wrong. Estimator-vs-itself can't detect truncation, but it
+    can detect a stale case file.
 
     Skip is per-case (collected into a list) rather than via pytest.skip,
     which aborts the whole loop on the first missing capture.

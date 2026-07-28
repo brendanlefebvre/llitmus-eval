@@ -89,3 +89,11 @@ Deleted `test_skip_non_assistant_start` — it was a no-op test that wrote captu
 $ python3 -m pytest tests/test_extract_main_replay.py -x -q
 28 passed in 0.17s
 ```
+
+## Post-review addendum (2026-07-28, reviewer)
+
+Two corrections to this report: the extractor was 447 lines as committed
+(not 375), and "Concerns: None" predated review — see
+docs/superpowers/plans/2026-07-28-main-replay-fixups.md (including its
+Round 2 section) for the defects found and fixed after this report was
+written.

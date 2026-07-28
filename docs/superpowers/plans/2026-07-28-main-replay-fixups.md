@@ -188,3 +188,46 @@ test pinning per-dimension denominators.
    ≈1.0, and fails loudly per-dimension; no pooled assert remains.
 5. Sidecar contains `action_valid_weighted`, `reference_model`, `by_chain`,
    `depth_weights` — and no pooled `action_valid`.
+
+## Round 2 (2026-07-28, applied post-review of the fixup commits)
+
+The fixup commits resolved items 1, 2, 5 and all should-fixes but left two
+silent shortfalls and introduced one HIGH defect. All closed in this round:
+
+1. **Weighted headline renormalization** — absent strata no longer drop their
+   weight silently; the rate renormalizes over present strata and the
+   aggregate publishes `depth_weight_coverage` (Σ present weights), with a
+   visible `coverage=… — missing strata` marker in the table when < 1.0. The
+   two tests that pinned the shrinking headline were re-pinned to the
+   renormalized values. Spec updated (renormalization rule).
+2. **F3a minimum gate** — tokenizer failures now surface as
+   `tokens_fed_error` on the case record instead of silent None, and a
+   prompt exceeding a sane `model_max_length` lands the case in `errored`
+   ("prompt exceeds model context: N > M") rather than scoring a silently
+   truncated generation. The drift test's overclaiming docstring was
+   rewritten to describe what exists; comparison against actual backend
+   consumption remains future work, stated as such.
+3. **Ledger accounting audit** — `audit_ledger` accounts for every
+   local-served `main` ledger row: nearest-in-window match (not
+   first-in-window — adjacent requests can arrive inside the same ±2s
+   window; verified live where the first-match variant named a chore decoy
+   450 ms off instead of the true serving capture 6 ms off), hard exit(1)
+   before the case file is written if a matched capture's successor pair was
+   sampled, ABSENT logged otherwise. Live run: 7 rows, 3 matched (all
+   excluded), 4 absent (pre-corpus).
+4. **Null-latency conservatism** — rows without `latency_ms` use a ±600s
+   window against completion ts and skip on match; the test that cemented
+   the leak was inverted.
+5. **Legitimate empty args** — `null`/`""` tool-call arguments are kept as
+   `{}`; only genuine decode failures and unexpected types skip, each with
+   an accurate log label.
+6. **Stable chain ids** — `chain-<first-capture-timestamp-stem>` instead of
+   positional numbering, so `by_chain` is comparable across extractions.
+7. **Minors closed** — F1 validates all parallel calls (per-call rows,
+   `id#N`); corpus snapshot persisted to `cases/main_replay.meta.json`;
+   `reference_model` sourced from case records (hardcoded fallbacks
+   removed); task report annotated.
+
+Remaining known gaps, deliberate: F3a backend-consumption comparison;
+strict-template (single-system-message) guard for the prompted injection —
+both noted in code/docstrings, neither blocks the increment-1 model set.

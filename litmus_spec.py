@@ -143,7 +143,7 @@ class ReplayCase:
     depth_stratum: str          # "shallow" | "mid" | "deep"
     est_tokens: int
     reference: dict             # {acted: bool, tools: list[str], arguments: list[dict]}
-    reference_model: str = "z-ai/glm-5.2"  # TODO: source from case file (extractor Task 3)
+    reference_model: Optional[str] = None  # sourced from the case file
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +317,7 @@ def _load_replay_line(obj: dict, ln: int) -> "ReplayCase":
     return ReplayCase(id=cid, capture_path=capture_path, chain_id=chain_id,
                       depth_stratum=depth_stratum, est_tokens=est_tokens,
                       reference=reference,
-                      reference_model=obj.get("reference_model", "z-ai/glm-5.2"))
+                      reference_model=obj.get("reference_model"))
 
 
 def load_cases(path: str, profile: str) -> list:
@@ -661,10 +661,15 @@ def aggregate_replay(per_case: list) -> dict:
     optionally carrying `depth_stratum` and `chain_id` keys for breakdowns.
 
     The headline `action_valid_weighted` is Σ stratum_rate × depth_weight over
-    in-scope strata (those with cases). No unweighted pooled number exists —
-    a pooled rate over an equal-N sample describes a traffic mix that does
-    not exist. Per-stratum and per-chain rates are unweighted (passes/n);
-    only the top-level number is weighted.
+    in-scope strata (those with cases), renormalized by the weight those strata
+    carry — an absent stratum narrows the claim instead of silently dragging
+    the number toward zero (a perfect shallow-only sample is 1.0, not 0.075).
+    `depth_weight_coverage` (Σ weight over strata with cases) reports how much
+    of the traffic mix the number represents; 1.0 when all three strata have
+    cases. No unweighted pooled number exists — a pooled rate over an equal-N
+    sample describes a traffic mix that does not exist. Per-stratum and
+    per-chain rates are unweighted (passes/n); only the top-level number is
+    weighted.
     """
     n_cases = len(per_case)
     dims = ["acted_ok", "well_formed", "tool_exists", "args_schema_ok"]
@@ -685,12 +690,17 @@ def aggregate_replay(per_case: list) -> dict:
             rate = 0.0
         by_depth[stratum] = {"action_valid": rate, "n": n}
 
-    # Weighted headline: Σ stratum_rate × depth_weight over strata with cases.
-    action_valid_weighted = 0.0
+    # Weighted headline: Σ stratum_rate × depth_weight over strata with cases,
+    # renormalized over the weight actually present. Coverage is reported
+    # alongside so consumers can see how much of the mix the number spans.
+    weighted_sum = 0.0
+    weight_present = 0.0
     for stratum, weight in _DEPTH_WEIGHTS.items():
         d = by_depth.get(stratum) or {}
         if d.get("n", 0):
-            action_valid_weighted += d["action_valid"] * weight
+            weighted_sum += d["action_valid"] * weight
+            weight_present += weight
+    action_valid_weighted = (weighted_sum / weight_present) if weight_present else 0.0
 
     by_chain: dict = {}
     for c in per_case:
@@ -703,15 +713,20 @@ def aggregate_replay(per_case: list) -> dict:
                       "n": len(vals)}
                 for cid, vals in by_chain.items()}
 
-    reference_model = "z-ai/glm-5.2"
-    for c in per_case:
-        rm = c.get("reference_model")
-        if rm:
-            reference_model = rm
-            break
+    # Derived from the per-case records (which carry the case file's value):
+    # unanimous -> that value, mixed -> sorted list, absent -> None.
+    ref_models = sorted({c["reference_model"] for c in per_case
+                         if c.get("reference_model")})
+    if not ref_models:
+        reference_model = None
+    elif len(ref_models) == 1:
+        reference_model = ref_models[0]
+    else:
+        reference_model = ref_models
 
     return {
         "action_valid_weighted": action_valid_weighted,
+        "depth_weight_coverage": weight_present,
         "by_dimension": by_dimension,
         "by_depth": by_depth,
         "by_chain": by_chain,
@@ -959,12 +974,28 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
             # number that can surface silent truncation on deep cases (40–60k
             # tokens) — est_tokens is the extractor's pre-template estimate
             # and can't see template overhead or context-window clipping. A
-            # tokenizer without encode() (e.g. a stub) records None rather
-            # than crashing the run.
+            # tokenizer without encode() (e.g. a stub) records None plus a
+            # tokens_fed_error note on the case record rather than crashing
+            # the run — a silent None would hide a broken gate.
+            tokens_fed_error = None
             try:
                 prompt_tokens_fed = len(tokenizer.encode(prompt))
-            except Exception:
+            except Exception as te:  # noqa: BLE001 - surface, don't crash
                 prompt_tokens_fed = None
+                tokens_fed_error = f"{type(te).__name__}: {te}"
+            # Minimum gate: if the tokenizer declares a sane context length
+            # and the rendered prompt exceeds it, scoring would grade a
+            # silently-truncated generation. Error the case instead (raising
+            # routes it through the same errored path as any other failure).
+            # Many tokenizers use a huge sentinel model_max_length; treat
+            # anything >= 10**9 as "no declared limit".
+            if prompt_tokens_fed is not None:
+                mml = getattr(tokenizer, "model_max_length", None)
+                if (isinstance(mml, int) and not isinstance(mml, bool)
+                        and 0 < mml < 10**9 and prompt_tokens_fed > mml):
+                    raise RuntimeError(
+                        f"prompt exceeds model context: "
+                        f"{prompt_tokens_fed} > {mml}")
             raw = generate_fn(prompt, max_tokens=max_tokens)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
@@ -979,14 +1010,17 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
         score_with_depth["chain_id"] = case.chain_id
         score_with_depth["reference_model"] = case.reference_model
         per_case_scores.append(score_with_depth)
-        records.append({
+        rec = {
             "id": case.id, "chain_id": case.chain_id,
             "depth_stratum": case.depth_stratum, "native": native,
             "score": score, "output_sample": text[:200],
             "thinking_unclosed": not closed,
             "prompt_tokens_fed": prompt_tokens_fed,
             "est_tokens": case.est_tokens,
-        })
+        }
+        if tokens_fed_error is not None:
+            rec["tokens_fed_error"] = tokens_fed_error
+        records.append(rec)
     return {"aggregate": aggregate_replay(per_case_scores),
             "cases": records, "errored": errored}
 
@@ -1032,8 +1066,15 @@ def format_constraint_table(label: str, result: dict) -> str:
 
 def format_replay_table(label: str, result: dict) -> str:
     agg = result["aggregate"]
-    lines = [f"{label}:  action_valid_weighted={agg.get('action_valid_weighted', 0.0):.2f}  "
-             f"(n={agg['n_cases']})"]
+    headline = (f"{label}:  action_valid_weighted="
+                f"{agg.get('action_valid_weighted', 0.0):.2f}  "
+                f"(n={agg['n_cases']})")
+    coverage = agg.get("depth_weight_coverage")
+    if coverage is not None and coverage < 1.0:
+        # The renormalized headline only speaks for the strata that have
+        # cases — flag how much of the traffic mix that is.
+        headline += f"  coverage={coverage:.2f} — missing strata"
+    lines = [headline]
     dims = agg.get("by_dimension") or {}
     if dims:
         parts = []

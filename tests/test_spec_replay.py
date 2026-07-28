@@ -469,8 +469,10 @@ class TestAggregateReplay:
         ]
         agg = aggregate_replay(per_case)
         assert agg["n_cases"] == 3
-        # weighted: mid=0.5*0.383 + deep=0.0*0.542 = 0.1915
-        assert agg["action_valid_weighted"] == pytest.approx(0.1915)
+        # weighted, renormalized over present strata (no shallow cases):
+        # (mid=0.5*0.383 + deep=0.0*0.542) / (0.383 + 0.542)
+        assert agg["action_valid_weighted"] == pytest.approx(0.1915 / 0.925)
+        assert agg["depth_weight_coverage"] == pytest.approx(0.925)
         assert agg["by_dimension"]["acted_ok"] == {"rate": 2 / 3, "n_applicable": 3}
         assert agg["by_dimension"]["well_formed"] == {"rate": 1.0, "n_applicable": 3}
         assert agg["by_dimension"]["tool_exists"] == {"rate": 2 / 3, "n_applicable": 3}
@@ -500,16 +502,36 @@ class TestAggregateReplay:
         assert agg["by_chain"]["chain-01"] == {"action_valid": 0.5, "n": 2}
         assert agg["by_chain"]["chain-02"] == {"action_valid": 1.0, "n": 1}
 
-    def test_aggregate_reference_model_default(self):
+    def test_aggregate_reference_model_absent_is_none(self):
         per_case = [{"action_valid": True, "depth_stratum": "mid"}]
         agg = aggregate_replay(per_case)
-        assert agg["reference_model"] == "z-ai/glm-5.2"
+        assert agg["reference_model"] is None
 
     def test_aggregate_reference_model_from_case(self):
         per_case = [{"action_valid": True, "depth_stratum": "mid",
                      "reference_model": "mlx-community/Qwen3-14B-4bit"}]
         agg = aggregate_replay(per_case)
         assert agg["reference_model"] == "mlx-community/Qwen3-14B-4bit"
+
+    def test_aggregate_reference_model_unanimous(self):
+        per_case = [
+            {"action_valid": True, "depth_stratum": "mid",
+             "reference_model": "z-ai/glm-5.2"},
+            {"action_valid": False, "depth_stratum": "deep",
+             "reference_model": "z-ai/glm-5.2"},
+        ]
+        agg = aggregate_replay(per_case)
+        assert agg["reference_model"] == "z-ai/glm-5.2"
+
+    def test_aggregate_reference_model_mixed_is_sorted_list(self):
+        per_case = [
+            {"action_valid": True, "depth_stratum": "mid",
+             "reference_model": "z-ai/glm-5.2"},
+            {"action_valid": True, "depth_stratum": "mid",
+             "reference_model": "anthropic/claude-x"},
+        ]
+        agg = aggregate_replay(per_case)
+        assert agg["reference_model"] == ["anthropic/claude-x", "z-ai/glm-5.2"]
 
     def test_aggregate_dimension_denominators(self):
         """Pin per-dimension n_applicable: None values excluded from denominators."""
@@ -534,10 +556,34 @@ class TestAggregateReplay:
         agg = aggregate_replay([])
         assert agg["depth_weights"] == {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
 
+    def test_aggregate_weight_coverage_semantics(self):
+        """Coverage is Σ weight over present strata; the headline renormalizes.
+
+        All three strata present -> coverage 1.0 and no renormalization
+        distortion. A missing stratum -> coverage < 1.0 and the headline is
+        the rate over the present mix, so a perfect shallow-only sample reads
+        1.0 (with coverage 0.075), not 0.075.
+        """
+        all_strata = [
+            {"action_valid": True, "depth_stratum": "shallow"},
+            {"action_valid": True, "depth_stratum": "mid"},
+            {"action_valid": True, "depth_stratum": "deep"},
+        ]
+        agg = aggregate_replay(all_strata)
+        assert agg["depth_weight_coverage"] == pytest.approx(1.0)
+        assert agg["action_valid_weighted"] == pytest.approx(1.0)
+
+        shallow_only = [{"action_valid": True, "depth_stratum": "shallow"}]
+        agg = aggregate_replay(shallow_only)
+        assert agg["depth_weight_coverage"] == pytest.approx(0.075)
+        assert agg["depth_weight_coverage"] < 1.0
+        assert agg["action_valid_weighted"] == pytest.approx(1.0)
+
     def test_aggregate_empty(self):
         agg = aggregate_replay([])
         assert agg["n_cases"] == 0
         assert agg["action_valid_weighted"] == 0.0
+        assert agg["depth_weight_coverage"] == 0.0
         for s in ("shallow", "mid", "deep"):
             assert agg["by_depth"][s] == {"action_valid": 0.0, "n": 0}
 
@@ -813,8 +859,66 @@ class TestRunMainReplay:
         # shallow: 2/2 pass, mid: 0/1 pass
         assert agg["by_depth"]["shallow"] == {"action_valid": 1.0, "n": 2}
         assert agg["by_depth"]["mid"] == {"action_valid": 0.0, "n": 1}
-        # weighted: 1.0*0.075 + 0.0*0.383 = 0.075
-        assert agg["action_valid_weighted"] == pytest.approx(0.075)
+        # weighted, renormalized over present strata (no deep cases):
+        # (1.0*0.075 + 0.0*0.383) / (0.075 + 0.383)
+        assert agg["action_valid_weighted"] == pytest.approx(0.075 / 0.458)
+        assert agg["depth_weight_coverage"] == pytest.approx(0.458)
+
+    def test_runner_tokenizer_failure_surfaced(self, tmp_path):
+        """F3a: tokenizer.encode raising must not kill the case — it is still
+        scored, with prompt_tokens_fed=None and a tokens_fed_error note on the
+        record so the failure is visible in the sidecar.
+        """
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap, acted=True)
+        tok = ReplayFakeTokenizer()
+        def boom_encode(text):
+            raise ValueError("no vocab loaded")
+        tok.encode = boom_encode
+        result = run_main_replay(
+            [case], tok,
+            lambda p, max_tokens=0: '{"tool": "read", "arguments": {"filePath": "f"}}',
+            native=False)
+        assert result["errored"] == []
+        rec = result["cases"][0]
+        assert rec["prompt_tokens_fed"] is None
+        assert "ValueError" in rec["tokens_fed_error"]
+        assert "no vocab loaded" in rec["tokens_fed_error"]
+        assert rec["score"]["action_valid"] is True  # still scored
+
+    def test_runner_prompt_overflow_lands_in_errored(self, tmp_path):
+        """F3a minimum gate: a rendered prompt longer than the tokenizer's
+        (sane) model_max_length is errored with the overflow reason instead of
+        scoring a silently-truncated generation.
+        """
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap, acted=True)
+        tok = ReplayFakeTokenizer()
+        tok.model_max_length = 3  # rendered prompt is far longer than 3 words
+        result = run_main_replay(
+            [case], tok,
+            lambda p, max_tokens=0: '{"tool": "read", "arguments": {"filePath": "f"}}',
+            native=False)
+        assert result["cases"] == []
+        err = result["errored"][0]
+        assert err["id"] == "mr-001"
+        assert "prompt exceeds model context" in err["error"]
+        assert "> 3" in err["error"]
+
+    def test_runner_sentinel_max_length_not_gated(self, tmp_path):
+        """A huge sentinel model_max_length (>= 10**9, the transformers
+        "unset" convention) must not trip the overflow gate.
+        """
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap, acted=True)
+        tok = ReplayFakeTokenizer()
+        tok.model_max_length = 10**9
+        result = run_main_replay(
+            [case], tok,
+            lambda p, max_tokens=0: '{"tool": "read", "arguments": {"filePath": "f"}}',
+            native=False)
+        assert result["errored"] == []
+        assert isinstance(result["cases"][0]["prompt_tokens_fed"], int)
 
     def test_runner_records_prompt_tokens_fed(self, tmp_path):
         """F3a: each per-case record carries prompt_tokens_fed (the count of
@@ -839,6 +943,8 @@ class TestRunMainReplay:
         rec = result["cases"][0]
         assert "prompt_tokens_fed" in rec
         assert rec["prompt_tokens_fed"] == len(seen_prompt["prompt"].split())
+        # sane path: no failure note on the record
+        assert "tokens_fed_error" not in rec
         # est_tokens is echoed from the case for sidecar-side comparison.
         assert rec["est_tokens"] == 20000
 
@@ -886,6 +992,30 @@ class TestFormatReplayTable:
         }, "cases": [], "errored": [{"id": "x", "error": "boom"}]}
         table = format_replay_table("M", result)
         assert "errored" in table
+
+    def test_table_flags_partial_coverage(self):
+        """coverage < 1.0 puts a visible marker on the headline line."""
+        result = {"aggregate": {
+            "action_valid_weighted": 1.0, "n_cases": 1,
+            "depth_weight_coverage": 0.458,
+            "by_dimension": {}, "by_depth": {}, "by_chain": {},
+            "reference_model": None,
+            "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
+        }, "cases": [], "errored": []}
+        table = format_replay_table("M", result)
+        assert "coverage=0.46" in table
+        assert "missing strata" in table
+
+    def test_table_no_coverage_flag_when_full(self):
+        result = {"aggregate": {
+            "action_valid_weighted": 0.5, "n_cases": 3,
+            "depth_weight_coverage": 1.0,
+            "by_dimension": {}, "by_depth": {}, "by_chain": {},
+            "reference_model": None,
+            "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
+        }, "cases": [], "errored": []}
+        table = format_replay_table("M", result)
+        assert "missing strata" not in table
 
     def test_table_with_empty_depth(self):
         result = {"aggregate": {

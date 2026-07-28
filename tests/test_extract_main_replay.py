@@ -163,6 +163,23 @@ class TestChainGrouping:
         rows = emr.load_captures(tmp_path)
         assert len(rows) == 1
 
+    def test_chain_id_stable_from_first_capture_ts(self, tmp_path):
+        # chain_id derives from the first capture's timestamp stem, not the
+        # chain's position — stable across extractions regardless of corpus
+        # growth or filtering.
+        msgs_a = [sys_msg(), user_msg("question A")]
+        msgs_b = [sys_msg(), user_msg("question B")]
+        write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
+        write_capture(tmp_path, "req-20260315T091500.123456-0007.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+
+        assert emr.chain_stable_id(chains[0]) == "chain-20260101T000000"
+        assert emr.chain_stable_id(chains[1]) == "chain-20260315T091500"
+        # Dropping the first chain leaves the second chain's id unchanged.
+        assert emr.chain_stable_id(chains[1:][0]) == "chain-20260315T091500"
+
 
 # ---------------------------------------------------------------------------
 # 2. Skip rules
@@ -280,10 +297,11 @@ class TestSkipRules:
         captured = capsys.readouterr()
         assert "Qwen3-14B" in captured.err
 
-    def test_qwen_no_match_without_latency_correction(self, tmp_path, capsys):
+    def test_qwen_null_latency_conservative_skip(self, tmp_path, capsys):
         # Same ledger completion ts as above, but latency_ms omitted (None).
-        # The completion ts (12:27:19.500) is ~2.5s after the capture arrival
-        # (12:27:17.000), which exceeds the ±2s window — so no skip fires.
+        # The arrival time cannot be recovered, so a WIDE ±600s window
+        # against the completion ts applies: any plausibly-related capture
+        # pair is skipped rather than kept, with a distinct reason.
         cap_name = "req-20260727T122717.000000-0003.json"
         ledger_ts = "2026-07-27T12:27:19.500000+00:00"
         qwen_entries = [{"ts": ledger_ts, "latency_ms": None}]
@@ -297,7 +315,31 @@ class TestSkipRules:
         chains = emr.group_chains(rows)
         usable = emr.process_pairs(chains, qwen_entries)
 
-        assert len(usable) == 1  # NOT skipped — no Qwen match
+        assert len(usable) == 0  # conservatively skipped
+        captured = capsys.readouterr()
+        assert "Qwen3-14B" in captured.err
+        assert "null latency_ms" in captured.err
+        assert "±600s" in captured.err
+
+    def test_qwen_null_latency_far_outside_window_not_skipped(
+            self, tmp_path, capsys):
+        # Null latency, but the completion ts is ~13 minutes (>600s) after
+        # the capture arrival — even the wide conservative window does not
+        # reach it, so the pair is kept.
+        cap_name = "req-20260727T122717.000000-0003.json"
+        ledger_ts = "2026-07-27T12:40:30.000000+00:00"
+        qwen_entries = [{"ts": ledger_ts, "latency_ms": None}]
+
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        write_capture(tmp_path, cap_name, msgs_a)
+        write_capture(tmp_path, "req-20260727T122718.000000-0004.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, qwen_entries)
+
+        assert len(usable) == 1  # NOT skipped — outside even ±600s
 
     def test_skip_over_limit(self, tmp_path, capsys):
         # Need est_tokens > 60000. estimate_prompt_tokens counts chars // 4
@@ -331,7 +373,7 @@ class TestSkipRules:
 
         assert len(usable) == 1
         pair = usable[0]
-        assert pair["chain_id"] == "chain-01"
+        assert pair["chain_id"] == "chain-20260101T000000"
         assert pair["depth_stratum"] == "shallow"
         assert pair["reference"]["acted"] is True
         assert pair["reference"]["tools"] == ["read"]
@@ -364,7 +406,7 @@ class TestSkipRules:
 
         captured = capsys.readouterr()
         assert "no pairs possible" in captured.err
-        assert "chain-01" in captured.err
+        assert "chain-20260101T000000" in captured.err
 
     def test_malformed_args_skips_pair(self, tmp_path, capsys):
         # A tool_call whose arguments are not valid JSON must skip the pair
@@ -391,6 +433,57 @@ class TestSkipRules:
         captured = capsys.readouterr()
         assert "malformed tool_call arguments" in captured.err
         assert "JSONDecodeError" in captured.err
+
+    def test_unexpected_args_type_skips_pair_with_type_label(
+            self, tmp_path, capsys):
+        # A tool_call whose arguments are neither null/""/str/dict must skip
+        # the pair with a reason naming the unexpected type — not the
+        # JSONDecodeError label, which would misname the cause.
+        weird_assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function",
+                 "function": {"name": "read",
+                              "arguments": 12345}},
+            ],
+        }
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), weird_assistant]
+        write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
+        write_capture(tmp_path, "req-20260101T000001.000000-0001.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, [])
+
+        assert len(usable) == 0
+        captured = capsys.readouterr()
+        assert "unexpected tool_call arguments type (int)" in captured.err
+        assert "JSONDecodeError" not in captured.err
+
+    def test_null_args_pair_kept(self, tmp_path, capsys):
+        # Explicit null arguments must NOT shrink the pair population.
+        null_assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function",
+                 "function": {"name": "list_files",
+                              "arguments": None}},
+            ],
+        }
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), null_assistant]
+        write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
+        write_capture(tmp_path, "req-20260101T000001.000000-0001.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, [])
+
+        assert len(usable) == 1
+        assert usable[0]["reference"]["arguments"] == [{}]
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +539,36 @@ class TestClassFilterBeforeGrouping:
             ],
         }
         assert emr.build_reference(weird_assistant) is None
+
+    def test_build_reference_null_args_kept_as_empty(self):
+        # Explicit JSON null arguments are legitimate (zero-parameter tools
+        # on some stacks) and map to {}, not a skip.
+        null_assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function",
+                 "function": {"name": "list_files",
+                              "arguments": None}},
+            ],
+        }
+        ref = emr.build_reference(null_assistant)
+        assert ref == {"acted": True, "tools": ["list_files"],
+                       "arguments": [{}]}
+
+    def test_build_reference_empty_string_args_kept_as_empty(self):
+        empty_assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function",
+                 "function": {"name": "list_files",
+                              "arguments": ""}},
+            ],
+        }
+        ref = emr.build_reference(empty_assistant)
+        assert ref == {"acted": True, "tools": ["list_files"],
+                       "arguments": [{}]}
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +705,7 @@ class TestCaseFormat:
 
         assert case["id"] == "mr-001"
         assert case["capture_path"].startswith("/")
-        assert case["chain_id"] == "chain-01"
+        assert case["chain_id"] == "chain-20260101T000000"
         assert case["depth_stratum"] == "shallow"
         assert isinstance(case["est_tokens"], int)
         assert case["reference"]["acted"] is True
@@ -667,3 +790,160 @@ class TestCaseFormat:
             assert "depth_stratum" in obj
             assert "est_tokens" in obj
             assert "reference" in obj
+
+
+# ---------------------------------------------------------------------------
+# 6. Ledger accounting audit
+# ---------------------------------------------------------------------------
+
+class TestLedgerAudit:
+    def _corpus_and_sample(self, tmp_path):
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        write_capture(tmp_path, "req-20260727T122717.000000-0003.json", msgs_a)
+        write_capture(tmp_path, "req-20260727T122718.000000-0004.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        # Empty qwen_entries: the skip rule missed the row (e.g. a
+        # served_model spelling load_qwen_timestamps does not recognize),
+        # so the pair lands in the sample — the audit's failure mode.
+        usable = emr.process_pairs(chains, [])
+        sample, _ = emr.sample_cases(usable, 5)
+        return rows, set(c["capture_path"] for c in sample)
+
+    def test_audit_trips_on_sampled_local_served_capture(
+            self, tmp_path, capsys):
+        rows, sampled_paths = self._corpus_and_sample(tmp_path)
+        assert sampled_paths  # the leaked pair really was sampled
+
+        ledger_rows = [{"ts": "2026-07-27T12:27:17.500000+00:00",
+                        "latency_ms": 500,
+                        "served_model": "Qwen/Qwen3-14B-AWQ"}]
+        with pytest.raises(SystemExit) as exc_info:
+            emr.audit_ledger(rows, ledger_rows, sampled_paths)
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "MATCHED capture req-20260727T122717.000000-0003.json" \
+            in captured.out
+        assert "AUDIT FAILURE" in captured.out
+
+    def test_audit_matches_nearest_capture_not_first_in_window(
+            self, tmp_path, capsys):
+        # Two captures 0.55s apart, both inside the ±2s window of the
+        # reconstructed arrival (12:27:17.000). The earlier file (-0002) is a
+        # decoy 0.45s off; the later (-0003) is 6ms off and its successor
+        # pair IS sampled. First-in-window matching would name the decoy and
+        # falsely pass; nearest-match must name -0003 and trip.
+        msgs_decoy = [sys_msg(), user_msg("decoy")]
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        write_capture(tmp_path, "req-20260727T122716.550000-0002.json",
+                      msgs_decoy)
+        write_capture(tmp_path, "req-20260727T122717.006000-0003.json",
+                      msgs_a)
+        write_capture(tmp_path, "req-20260727T122718.000000-0004.json",
+                      msgs_b)
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, [])
+        sample, _ = emr.sample_cases(usable, 5)
+        sampled_paths = set(c["capture_path"] for c in sample)
+        assert sampled_paths
+
+        ledger_rows = [{"ts": "2026-07-27T12:27:17.500000+00:00",
+                        "latency_ms": 500,
+                        "served_model": "Qwen/Qwen3-14B-AWQ"}]
+        with pytest.raises(SystemExit) as exc_info:
+            emr.audit_ledger(rows, ledger_rows, sampled_paths)
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "MATCHED capture req-20260727T122717.006000-0003.json" \
+            in captured.out
+
+    def test_audit_passes_when_row_absent_from_corpus(
+            self, tmp_path, capsys):
+        rows, sampled_paths = self._corpus_and_sample(tmp_path)
+
+        # Ledger ts months away from any capture — no match possible even
+        # with the wide null-latency window.
+        ledger_rows = [{"ts": "2026-01-01T00:00:00.000000+00:00",
+                        "latency_ms": None,
+                        "served_model": "Qwen/Qwen3-14B-AWQ"}]
+        emr.audit_ledger(rows, ledger_rows, sampled_paths)  # must not exit
+        captured = capsys.readouterr()
+        assert ("ledger row 2026-01-01T00:00:00.000000+00:00 "
+                "served_model=Qwen/Qwen3-14B-AWQ: "
+                "no matching capture in corpus") in captured.out
+        assert ("Qwen audit: 1 local-served main rows, 0 matched "
+                "(all excluded), 1 absent") in captured.out
+
+    def test_audit_matched_but_excluded_passes(self, tmp_path, capsys):
+        # A matched capture whose successor pair was NOT sampled is fine.
+        rows, _ = self._corpus_and_sample(tmp_path)
+
+        ledger_rows = [{"ts": "2026-07-27T12:27:17.500000+00:00",
+                        "latency_ms": 500,
+                        "served_model": "Qwen/Qwen3-14B-AWQ"}]
+        emr.audit_ledger(rows, ledger_rows, set())  # must not exit
+        captured = capsys.readouterr()
+        assert ("Qwen audit: 1 local-served main rows, 1 matched "
+                "(all excluded), 0 absent") in captured.out
+
+    def test_load_local_main_rows_filters_class_and_route(self, tmp_path):
+        ledger = tmp_path / "adequacy.jsonl"
+        entries = [
+            {"class": "main", "route": "local",
+             "ts": "2026-07-27T12:00:00+00:00", "latency_ms": 1200,
+             "served_model": "Qwen/Qwen3-14B"},
+            {"class": "main", "route": "remote",
+             "ts": "2026-07-27T12:01:00+00:00", "latency_ms": 900,
+             "served_model": "z-ai/glm-5.2"},
+            {"class": "chore", "route": "local",
+             "ts": "2026-07-27T12:02:00+00:00", "latency_ms": 300,
+             "served_model": "Qwen/Qwen3-14B"},
+            {"class": "main", "route": "local",
+             "ts": "2026-07-27T12:03:00+00:00", "latency_ms": None,
+             "served_model": None},
+        ]
+        ledger.write_text(
+            "\n".join(json.dumps(e) for e in entries) + "\n",
+            encoding="utf-8")
+
+        rows = emr.load_local_main_rows(ledger)
+
+        assert len(rows) == 2
+        assert rows[0]["latency_ms"] == 1200
+        assert rows[1]["latency_ms"] is None
+        assert rows[1]["served_model"] == "(unknown)"
+
+
+# ---------------------------------------------------------------------------
+# 7. Corpus snapshot metadata
+# ---------------------------------------------------------------------------
+
+class TestCorpusMeta:
+    def test_meta_file_written_with_snapshot_fields(self, tmp_path):
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
+        write_capture(tmp_path, "req-20260101T000001.000000-0001.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, [])
+        sample, coverage = emr.sample_cases(usable, 5)
+
+        output_path = tmp_path / "cases" / "main_replay.jsonl"
+        meta_path = emr.write_meta(
+            output_path, len(rows), rows[-1]["name"], sample, coverage)
+
+        assert meta_path == tmp_path / "cases" / "main_replay.meta.json"
+        assert meta_path.exists()
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["corpus_files"] == 2
+        assert meta["newest_capture"] == \
+            "req-20260101T000001.000000-0001.json"
+        assert meta["n_cases"] == 1
+        assert meta["strata"] == {"shallow": 1, "mid": 0, "deep": 0}
+        assert meta["chains_represented"] == ["chain-20260101T000000"]

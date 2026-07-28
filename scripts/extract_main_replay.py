@@ -79,6 +79,21 @@ def load_captures(capture_dir: pathlib.Path) -> list[dict]:
     return rows
 
 
+def chain_stable_id(chain: list[dict]) -> str:
+    """Stable chain id derived from the first capture's timestamp stem.
+
+    "req-20260728T115606.817785-0209.json" -> "chain-20260728T115606".
+    Unlike a positional chain-NN index, this is stable across extractions
+    regardless of corpus growth or filtering, so regenerated case files'
+    by_chain groupings are comparable across runs.
+    """
+    name = chain[0]["name"]
+    m = FILENAME_TS_RE.match(name)
+    if m:
+        return f"chain-{m.group(1).split('.')[0]}"
+    return f"chain-{pathlib.Path(name).stem}"
+
+
 def group_chains(rows: list[dict]) -> list[list[dict]]:
     chains: list[list[dict]] = []
     cur: list[dict] = []
@@ -154,12 +169,33 @@ def load_qwen_timestamps(ledger_path: pathlib.Path) -> list[dict]:
     return out
 
 
-def _ts_within_2s(capture_ts: datetime, ledger_ts_str: str,
-                  latency_ms: int | None) -> bool:
+NULL_LATENCY_WINDOW_S = 600
+
+
+def _ts_within_window(capture_ts: datetime, ledger_ts_str: str,
+                      latency_ms: int | None) -> bool:
     """Compare a capture arrival ts to a ledger completion ts.
 
     The ledger ``ts`` is stamped at response completion (arrival + latency).
-    Subtract ``latency_ms`` to recover the true arrival time before comparing.
+    Subtract ``latency_ms`` to recover the true arrival time, then compare
+    within ±2s. When ``latency_ms`` is None the arrival time cannot be
+    recovered, so fall back to a WIDE conservative window (±600s) against the
+    completion ts: any plausibly-related capture counts as a match, and
+    callers skip matches rather than keep them.
+    """
+    delta = _ts_delta_seconds(capture_ts, ledger_ts_str, latency_ms)
+    if delta is None:
+        return False
+    window = NULL_LATENCY_WINDOW_S if latency_ms is None else 2
+    return delta <= window
+
+
+def _ts_delta_seconds(capture_ts: datetime, ledger_ts_str: str,
+                      latency_ms: int | None) -> float | None:
+    """Absolute seconds between a capture arrival and a ledger row's
+    reconstructed arrival (completion ts when latency is unknown), or None
+    when the ledger ts cannot be parsed. Split out so audit_ledger can rank
+    near-simultaneous captures by proximity instead of file order.
     """
     try:
         ledger_ts = datetime.fromisoformat(ledger_ts_str)
@@ -167,26 +203,114 @@ def _ts_within_2s(capture_ts: datetime, ledger_ts_str: str,
             ledger_ts = ledger_ts.replace(tzinfo=None)
         if latency_ms is not None:
             ledger_ts = ledger_ts - timedelta(milliseconds=latency_ms)
-        return abs((capture_ts - ledger_ts).total_seconds()) <= 2
+        return abs((capture_ts - ledger_ts).total_seconds())
     except (ValueError, TypeError):
-        return False
+        return None
 
 
 def is_qwen_authored(capture_name: str,
-                     qwen_entries: list[dict]) -> str | None:
-    """Return the matching ledger ``ts`` if capture N was Qwen3-14B-served.
+                     qwen_entries: list[dict]) -> dict | None:
+    """Return the matching ledger entry if capture N was Qwen3-14B-served.
 
     ``qwen_entries`` are the dicts from :func:`load_qwen_timestamps`. The
-    returned ts is the ledger's completion ts (preserved for log clarity);
-    correlation uses arrival = ts - latency_ms.
+    returned entry carries the ledger's completion ``ts`` (preserved for log
+    clarity) and ``latency_ms``; correlation uses arrival = ts - latency_ms,
+    or the wide null-latency window when latency_ms is None.
     """
     capture_ts = parse_capture_ts(capture_name)
     if capture_ts is None:
         return None
     for entry in qwen_entries:
-        if _ts_within_2s(capture_ts, entry["ts"], entry.get("latency_ms")):
-            return entry["ts"]
+        if _ts_within_window(capture_ts, entry["ts"],
+                             entry.get("latency_ms")):
+            return entry
     return None
+
+
+# ---------------------------------------------------------------------------
+# Ledger accounting audit
+# ---------------------------------------------------------------------------
+
+def load_local_main_rows(ledger_path: pathlib.Path) -> list[dict]:
+    """Return all ``main``-class, locally-routed ledger entries.
+
+    Unlike :func:`load_qwen_timestamps` this does not filter on served_model:
+    the audit must account for EVERY locally-served main request, whatever
+    model name the ledger recorded.
+    """
+    if not ledger_path.exists():
+        return []
+    out = []
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("class") != "main":
+            continue
+        if entry.get("route") != "local":
+            continue
+        ts = entry.get("ts")
+        if ts:
+            latency = entry.get("latency_ms")
+            out.append({
+                "ts": ts,
+                "latency_ms": int(latency) if latency is not None else None,
+                "served_model": entry.get("served_model") or "(unknown)",
+            })
+    return out
+
+
+def audit_ledger(capture_rows: list[dict], ledger_rows: list[dict],
+                 sampled_paths: set[str]) -> None:
+    """Account for every locally-served main ledger row against the corpus.
+
+    For each row, reconstruct the serving-capture arrival (ts - latency_ms,
+    or the wide null-latency window) and match it against the loaded capture
+    corpus. A matched capture whose successor pair landed in the sampled case
+    file is a hard failure — a locally-served reference must never be
+    replayed as ground truth — so exit(1). Unmatched rows are logged ABSENT.
+    """
+    matched = 0
+    absent = 0
+    for entry in ledger_rows:
+        # Nearest in-window capture, not first: adjacent requests can arrive
+        # within the same ±2s window (e.g. a chore fired 0.4s before a main
+        # turn), and auditing the wrong neighbor's successor would let the
+        # real pair through.
+        match = None
+        best_delta = None
+        for r in capture_rows:
+            cap_ts = parse_capture_ts(r["name"])
+            if cap_ts is None:
+                continue
+            if _ts_within_window(cap_ts, entry["ts"],
+                                 entry.get("latency_ms")):
+                delta = _ts_delta_seconds(cap_ts, entry["ts"],
+                                          entry.get("latency_ms"))
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    match = r
+        if match is None:
+            absent += 1
+            print(f"ledger row {entry['ts']} "
+                  f"served_model={entry['served_model']}: "
+                  f"no matching capture in corpus")
+            continue
+        matched += 1
+        print(f"ledger row {entry['ts']} "
+              f"served_model={entry['served_model']}: "
+              f"MATCHED capture {match['name']}")
+        if str(match["path"].resolve()) in sampled_paths:
+            print(f"AUDIT FAILURE: capture {match['name']} was locally "
+                  f"served ({entry['served_model']}) but its successor pair "
+                  f"was emitted into the sampled case file")
+            sys.exit(1)
+    print(f"Qwen audit: {len(ledger_rows)} local-served main rows, "
+          f"{matched} matched (all excluded), {absent} absent")
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +335,12 @@ def build_reference(assistant_msg: dict) -> dict | None:
     """Build the reference action from an assistant turn.
 
     Returns ``None`` if the turn is malformed (no tool_calls and no content),
-    or if any tool_call's ``arguments`` fail to parse as JSON. The latter
-    signals "skip the pair" rather than silently substituting empty args —
-    tier-1 will consume these arguments in increment 2, so masking malformed
-    JSON would hide a real failure mode.
+    if any tool_call's string ``arguments`` fail to parse as JSON, or if
+    ``arguments`` is an unexpected type. An explicit JSON null or ``""`` is
+    NOT malformed — some stacks emit those for zero-parameter tools — and
+    maps to ``{}``. Genuine parse failures signal "skip the pair" rather than
+    silently substituting empty args — tier-1 will consume these arguments in
+    increment 2, so masking malformed JSON would hide a real failure mode.
     """
     tool_calls = assistant_msg.get("tool_calls")
     if tool_calls:
@@ -224,13 +350,15 @@ def build_reference(assistant_msg: dict) -> dict | None:
             fn = tc.get("function", {})
             tools.append(fn.get("name"))
             args_raw = fn.get("arguments", "{}")
-            if isinstance(args_raw, str):
+            if args_raw is None or args_raw == "":
+                args = {}  # legitimate empty (zero-parameter tool)
+            elif isinstance(args_raw, dict):
+                args = args_raw
+            elif isinstance(args_raw, str):
                 try:
                     args = json.loads(args_raw)
                 except json.JSONDecodeError:
                     return None  # signal skip in process_pairs
-            elif isinstance(args_raw, dict):
-                args = args_raw
             else:
                 return None  # signal skip in process_pairs
             arguments.append(args)
@@ -241,6 +369,28 @@ def build_reference(assistant_msg: dict) -> dict | None:
     return None
 
 
+def _bad_args_reason(tool_calls: list) -> str:
+    """Name the cause of a build_reference args rejection for the skip log.
+
+    Mirrors the acceptance logic in :func:`build_reference` so the logged
+    reason distinguishes a genuine JSON decode error from an unexpected
+    arguments type.
+    """
+    for tc in tool_calls:
+        args_raw = tc.get("function", {}).get("arguments", "{}")
+        if args_raw is None or args_raw == "" or isinstance(args_raw, dict):
+            continue
+        if isinstance(args_raw, str):
+            try:
+                json.loads(args_raw)
+            except json.JSONDecodeError:
+                return "malformed tool_call arguments (JSONDecodeError)"
+            continue
+        return (f"unexpected tool_call arguments type "
+                f"({type(args_raw).__name__})")
+    return "malformed tool_call arguments (JSONDecodeError)"
+
+
 # ---------------------------------------------------------------------------
 # Pair extraction and skip rules
 # ---------------------------------------------------------------------------
@@ -248,8 +398,8 @@ def build_reference(assistant_msg: dict) -> dict | None:
 def process_pairs(chains: list[list[dict]],
                   qwen_entries: list[dict]) -> list[dict]:
     usable = []
-    for chain_idx, chain in enumerate(chains, 1):
-        chain_id = f"chain-{chain_idx:02d}"
+    for chain in chains:
+        chain_id = chain_stable_id(chain)
         if len(chain) < 2:
             print(f"SKIP chain {chain_id}: {len(chain)} capture(s) "
                   f"— no pairs possible", file=sys.stderr)
@@ -287,26 +437,35 @@ def process_pairs(chains: list[list[dict]],
 
             ref_msg = cap_n1["body"]["messages"][cap_n["n"]]
 
-            # Determine whether the reference is malformed (JSONDecodeError on
-            # tool_call arguments) vs pathological (no tool_calls, no
-            # content). build_reference returns None for both; disambiguate
-            # by inspecting ref_msg so the skip reason is accurate.
+            # Determine whether the reference has bad tool_call arguments
+            # (decode error or unexpected type) vs is pathological (no
+            # tool_calls, no content). build_reference returns None for both;
+            # disambiguate by inspecting ref_msg so the skip reason is
+            # accurate.
             ref = build_reference(ref_msg)
             if ref is None:
                 tcs = ref_msg.get("tool_calls")
                 if tcs:
-                    print(f"SKIP {pair_label}: malformed tool_call "
-                          f"arguments (JSONDecodeError)", file=sys.stderr)
+                    print(f"SKIP {pair_label}: {_bad_args_reason(tcs)}",
+                          file=sys.stderr)
                 else:
                     print(f"SKIP {pair_label}: pathological reference "
                           f"(no tool_calls, no content)", file=sys.stderr)
                 continue
 
             # Skip rule 4: Qwen3-14B-authored turns
-            qwen_ts = is_qwen_authored(cap_n["name"], qwen_entries)
-            if qwen_ts is not None:
-                print(f"SKIP {pair_label}: reference authored by Qwen3-14B "
-                      f"(ledger ts={qwen_ts})", file=sys.stderr)
+            qwen_entry = is_qwen_authored(cap_n["name"], qwen_entries)
+            if qwen_entry is not None:
+                if qwen_entry.get("latency_ms") is None:
+                    print(f"SKIP {pair_label}: reference plausibly authored "
+                          f"by Qwen3-14B (ledger ts={qwen_entry['ts']}, "
+                          f"null latency_ms — conservative "
+                          f"±{NULL_LATENCY_WINDOW_S}s window)",
+                          file=sys.stderr)
+                else:
+                    print(f"SKIP {pair_label}: reference authored by "
+                          f"Qwen3-14B (ledger ts={qwen_entry['ts']})",
+                          file=sys.stderr)
                 continue
 
             # Depth stratum (over-limit is excluded)
@@ -390,6 +549,32 @@ def sample_cases(usable: list[dict],
 
 
 # ---------------------------------------------------------------------------
+# Corpus snapshot metadata
+# ---------------------------------------------------------------------------
+
+def write_meta(output_path: pathlib.Path, corpus_count: int,
+               newest_name: str, final_cases: list[dict],
+               coverage: dict) -> pathlib.Path:
+    """Persist the corpus snapshot as a sibling ``<stem>.meta.json``.
+
+    The captures dir grows over time; the stdout snapshot line alone leaves
+    no durable record of which population an extraction saw.
+    """
+    meta_path = output_path.with_name(output_path.stem + ".meta.json")
+    meta = {
+        "corpus_files": corpus_count,
+        "newest_capture": newest_name,
+        "n_cases": len(final_cases),
+        "strata": {s: coverage.get(s, {}).get("n", 0) for s in STRATA},
+        "chains_represented": sorted(
+            set(c["chain_id"] for c in final_cases)),
+    }
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return meta_path
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -457,6 +642,14 @@ def main() -> None:
             "reference": case["reference"],
         })
 
+    # Ledger accounting audit: every locally-served main row must map to a
+    # capture whose successor pair was excluded from the sample. Runs before
+    # the case file is written so a failed audit never persists a poisoned
+    # case set.
+    local_rows = load_local_main_rows(ADEQUACY_LEDGER)
+    sampled_paths = set(c["capture_path"] for c in final_cases)
+    audit_ledger(rows, local_rows, sampled_paths)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         for case in final_cases:
@@ -468,8 +661,8 @@ def main() -> None:
     print(f"Main-class captures: {len(main_rows)} "
           f"({len(rows) - len(main_rows)} non-main dropped)")
     print(f"Chains found: {len(chains)}")
-    for i, c in enumerate(chains, 1):
-        print(f"  chain-{i:02d}: {len(c)} captures "
+    for c in chains:
+        print(f"  {chain_stable_id(c)}: {len(c)} captures "
               f"({c[0]['name']} .. {c[-1]['name']})")
     print(f"Total usable pairs: {len(usable)}")
     print("Pairs per stratum (before sampling):")
@@ -512,7 +705,10 @@ def main() -> None:
         if multi:
             print(f"  NOTE: two-chain coverage only in: {', '.join(multi)}")
         print(f"  SINGLE-CHAIN strata: {', '.join(single)}")
+    meta_path = write_meta(output_path, corpus_count, newest_name,
+                           final_cases, coverage)
     print(f"\nWrote {len(final_cases)} cases to {output_path}")
+    print(f"Wrote corpus snapshot metadata to {meta_path}")
 
 
 if __name__ == "__main__":
