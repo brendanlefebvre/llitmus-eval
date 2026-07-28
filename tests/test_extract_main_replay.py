@@ -186,24 +186,6 @@ class TestSkipRules:
         captured = capsys.readouterr()
         assert "not main" in captured.err
 
-    def test_skip_non_assistant_start(self, tmp_path, capsys):
-        msgs_a = [sys_msg(), user_msg()]
-        # Appended messages start with "tool", not "assistant"
-        msgs_b = [sys_msg(), user_msg(),
-                  assistant_tool_msg(), tool_msg(),
-                  {"role": "user", "content": "more"}]
-        write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
-        write_capture(tmp_path, "req-20260101T000001.000000-0001.json", msgs_b)
-
-        rows = emr.load_captures(tmp_path)
-        chains = emr.group_chains(rows)
-        # The pair (a,b) has appended [assistant, tool, user] — assistant first,
-        # so that's usable. We need a pair where the first appended is NOT assistant.
-        # Let's create a different scenario: appended starts with tool.
-        # Actually the above has assistant first. Let me create a chain where
-        # appended starts with a tool message.
-        pass  # This test needs a more specific setup — see below
-
     def test_skip_appended_starts_with_user(self, tmp_path, capsys):
         # Capture N: [sys, user, assistant, tool]
         # Capture N+1: [sys, user, assistant, tool, user, assistant]
