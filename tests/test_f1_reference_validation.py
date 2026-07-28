@@ -153,8 +153,10 @@ def _capture_tools(capture_path: str) -> list:
 def test_f1_reference_self_validation():
     """F1: tier-0 validators must pass ~100% on real glm-5.2 reference actions.
 
-    Any systematic failure means the harness is measuring itself, not the model
-    (the parse_native failure mode). Hard stop until fixed.
+    Gated per dimension (acted_ok, well_formed, tool_exists, args_schema_ok),
+    each at ≈1.0 over its applicable-case denominator. Uncheckable dimensions
+    (None) are excluded from denominators. The diagnostic value of F1 is
+    *which* dimension fails, so a pooled rate is never used.
     """
     cases = _require_cases()
 
@@ -183,26 +185,40 @@ def test_f1_reference_self_validation():
     if not results:
         pytest.skip("no reference actions could be resolved from captures")
 
-    action_valid_rate = (
-        sum(1 for r in results if r["action_valid"]) / len(results)
-    )
+    # Per-dimension rates over applicable cases (None excluded).
+    dims = ["acted_ok", "well_formed", "tool_exists", "args_schema_ok"]
+    dim_stats = {}
+    for d in dims:
+        vals = [r[d] for r in results]
+        present = [v for v in vals if v is not None]
+        rate = (sum(1 for v in present if v) / len(present)) if present else None
+        dim_stats[d] = {"rate": rate, "n_applicable": len(present)}
 
-    # Per-case reporting on failure: which dimensions dropped.
-    failures = [r for r in results if not r["action_valid"]]
-    if failures:
-        detail = "\n".join(
-            f"  {r['id']}: acted_ok={r['acted_ok']} well_formed="
-            f"{r['well_formed']} tool_exists={r['tool_exists']} "
-            f"args_schema_ok={r['args_schema_ok']}"
-            for r in failures
-        )
-    else:
-        detail = ""
+    # Always print all four rates + denominators.
+    print("\nF1 per-dimension reference self-validation:")
+    for d in dims:
+        s = dim_stats[d]
+        rate_str = f"{s['rate']:.3f}" if s['rate'] is not None else "N/A"
+        print(f"  {d}: rate={rate_str} n_applicable={s['n_applicable']}")
+    if skipped:
+        print(f"  (skipped {len(skipped)} case(s): {', '.join(skipped)})")
 
-    assert action_valid_rate >= 0.90, (
-        f"F1 FAILED: reference self-validation rate={action_valid_rate:.2f} "
-        f"(expected ~1.0). Harness validators cannot validate real glm-5.2 "
-        f"actions.\nFailures:\n{detail}"
+    # Gate each dimension separately at ≈1.0.
+    failures = []
+    for d in dims:
+        s = dim_stats[d]
+        if s["rate"] is not None and s["rate"] < 0.99:
+            # Collect per-case detail for the failing dimension.
+            failing_ids = [r["id"] for r in results if r[d] is False]
+            failures.append(
+                f"{d}: rate={s['rate']:.3f} n_applicable={s['n_applicable']} "
+                f"(failing cases: {', '.join(failing_ids)})"
+            )
+
+    assert not failures, (
+        "F1 FAILED: per-dimension reference self-validation below ~1.0.\n"
+        "Harness validators cannot validate real glm-5.2 actions.\n"
+        + "\n".join(f"  {f}" for f in failures)
     )
 
 

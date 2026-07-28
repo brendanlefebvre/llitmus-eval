@@ -143,6 +143,7 @@ class ReplayCase:
     depth_stratum: str          # "shallow" | "mid" | "deep"
     est_tokens: int
     reference: dict             # {acted: bool, tools: list[str], arguments: list[dict]}
+    reference_model: str = "z-ai/glm-5.2"  # TODO: source from case file (extractor Task 3)
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +316,8 @@ def _load_replay_line(obj: dict, ln: int) -> "ReplayCase":
         raise CaseError(f"line {ln}: reference.arguments must be a list")
     return ReplayCase(id=cid, capture_path=capture_path, chain_id=chain_id,
                       depth_stratum=depth_stratum, est_tokens=est_tokens,
-                      reference=reference)
+                      reference=reference,
+                      reference_model=obj.get("reference_model", "z-ai/glm-5.2"))
 
 
 def load_cases(path: str, profile: str) -> list:
@@ -589,28 +591,37 @@ def score_replay_call(parsed: "ParsedCall", case: "ReplayCase",
         action_valid (bool).
     """
     if not closed:
-        # thinking budget exhausted — no answer to score. All-false, matching
-        # the existing profiles' treatment of an unclosed thinking tag.
-        return {"acted_ok": False, "well_formed": False, "tool_exists": False,
-                "args_schema_ok": False, "action_valid": False}
+        # thinking budget exhausted — nothing was produced to check. acted_ok
+        # is False (it did not act); the remaining dimensions are not
+        # applicable (no action was produced), so they are None per the
+        # dimension-applicability rule.
+        return {"acted_ok": False, "well_formed": None, "tool_exists": None,
+                "args_schema_ok": None, "action_valid": False}
 
     ref = case.reference
     ref_acted = bool(ref.get("acted"))
-    candidate_acted = parsed.tool is not None
+    candidate_attempted = parsed.attempted  # a structure was present or a call parsed
+    candidate_acted = parsed.tool is not None  # a well-formed tool call was made
 
-    acted_ok = (ref_acted == candidate_acted)
-    well_formed = parsed.well_formed
+    if not candidate_attempted:
+        # Model chose prose, never attempted a call. acted_ok: did the model
+        # do the right thing (act vs prose)? well_formed/tool_exists/
+        # args_schema_ok are not applicable (no action to check).
+        acted_ok = not ref_acted  # correct iff reference also didn't act
+        return {"acted_ok": acted_ok, "well_formed": None,
+                "tool_exists": None, "args_schema_ok": None,
+                "action_valid": acted_ok}
+
+    # Model attempted a call (well-formed or not). acted_ok is correct iff
+    # the reference acted (the model tried to act when it should).
+    acted_ok = ref_acted
+    well_formed = parsed.well_formed  # meaningful: did the attempt parse?
 
     if not candidate_acted:
-        # No tool call: tool_exists is vacuously satisfied; args_schema is not
-        # checkable. action_valid turns on acted_ok + well_formed only.
-        # When the candidate correctly abstained (ref didn't act either), the
-        # prose response is itself well-formed — mirrors score_tool_call's
-        # native abstention handling (well_formed = True if abstained_ok).
-        well_formed = True if acted_ok else parsed.well_formed
+        # Attempted but failed to produce a well-formed call.
         return {"acted_ok": acted_ok, "well_formed": well_formed,
-                "tool_exists": True, "args_schema_ok": None,
-                "action_valid": acted_ok and well_formed}
+                "tool_exists": None, "args_schema_ok": None,
+                "action_valid": False}  # not well_formed → not valid
 
     tool_names = _capture_tool_names(capture_tools)
     tool_exists = parsed.tool in tool_names
@@ -643,13 +654,22 @@ def aggregate_replay(per_case: list) -> dict:
     """Aggregate main-replay tier-0 results.
 
     `per_case` is a list of score dicts (from score_replay_call), each
-    optionally carrying a `depth_stratum` key for per-stratum breakdown.
+    optionally carrying `depth_stratum` and `chain_id` keys for breakdowns.
+
+    The headline `action_valid_weighted` is Σ stratum_rate × depth_weight over
+    in-scope strata (those with cases). No unweighted pooled number exists —
+    a pooled rate over an equal-N sample describes a traffic mix that does
+    not exist. Per-stratum and per-chain rates are unweighted (passes/n);
+    only the top-level number is weighted.
     """
     n_cases = len(per_case)
     dims = ["acted_ok", "well_formed", "tool_exists", "args_schema_ok"]
-    by_dimension = {d: _rate([c.get(d) for c in per_case]) for d in dims}
-    action_valid = (sum(1 for c in per_case if c.get("action_valid")) / n_cases
-                    if n_cases else 0.0)
+    by_dimension = {}
+    for d in dims:
+        vals = [c.get(d) for c in per_case]
+        present = [v for v in vals if v is not None]
+        rate = (sum(1 for v in present if v) / len(present)) if present else None
+        by_dimension[d] = {"rate": rate, "n_applicable": len(present)}
 
     by_depth: dict = {}
     for stratum in _REPLAY_STRATA:
@@ -661,10 +681,37 @@ def aggregate_replay(per_case: list) -> dict:
             rate = 0.0
         by_depth[stratum] = {"action_valid": rate, "n": n}
 
+    # Weighted headline: Σ stratum_rate × depth_weight over strata with cases.
+    action_valid_weighted = 0.0
+    for stratum, weight in _DEPTH_WEIGHTS.items():
+        d = by_depth.get(stratum) or {}
+        if d.get("n", 0):
+            action_valid_weighted += d["action_valid"] * weight
+
+    by_chain: dict = {}
+    for c in per_case:
+        cid = c.get("chain_id")
+        if cid is None:
+            continue
+        by_chain.setdefault(cid, []).append(c.get("action_valid"))
+    by_chain = {cid: {"action_valid": (sum(1 for v in vals if v)
+                                       / len(vals) if vals else 0.0),
+                      "n": len(vals)}
+                for cid, vals in by_chain.items()}
+
+    reference_model = "z-ai/glm-5.2"
+    for c in per_case:
+        rm = c.get("reference_model")
+        if rm:
+            reference_model = rm
+            break
+
     return {
-        "action_valid": action_valid,
+        "action_valid_weighted": action_valid_weighted,
         "by_dimension": by_dimension,
         "by_depth": by_depth,
+        "by_chain": by_chain,
+        "reference_model": reference_model,
         "depth_weights": dict(_DEPTH_WEIGHTS),
         "n_cases": n_cases,
     }
@@ -898,9 +945,12 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
         text, closed = strip_thinking(raw)
         parsed = parse_native(text) if native else parse_prompted(text)
         score = score_replay_call(parsed, case, capture_tools, closed=closed)
-        # Attach depth_stratum so aggregate_replay can break down by stratum.
+        # Attach depth_stratum, chain_id, reference_model so aggregate_replay
+        # can break down by stratum, chain, and report the reference model.
         score_with_depth = dict(score)
         score_with_depth["depth_stratum"] = case.depth_stratum
+        score_with_depth["chain_id"] = case.chain_id
+        score_with_depth["reference_model"] = case.reference_model
         per_case_scores.append(score_with_depth)
         records.append({
             "id": case.id, "chain_id": case.chain_id,
@@ -953,12 +1003,19 @@ def format_constraint_table(label: str, result: dict) -> str:
 
 def format_replay_table(label: str, result: dict) -> str:
     agg = result["aggregate"]
-    lines = [f"{label}:  action_valid={agg['action_valid']:.2f}  "
+    lines = [f"{label}:  action_valid_weighted={agg.get('action_valid_weighted', 0.0):.2f}  "
              f"(n={agg['n_cases']})"]
     dims = agg.get("by_dimension") or {}
     if dims:
-        lines.append("  by dimension: " + "  ".join(
-            f"{k}={_fmt(v)}" for k, v in dims.items()))
+        parts = []
+        for k, v in dims.items():
+            if isinstance(v, dict):
+                rate = v.get("rate")
+                n = v.get("n_applicable", 0)
+                parts.append(f"{k}={_fmt(rate)}(n={n})")
+            else:
+                parts.append(f"{k}={_fmt(v)}")
+        lines.append("  by dimension: " + "  ".join(parts))
     by_depth = agg.get("by_depth") or {}
     if by_depth:
         parts = []
@@ -978,7 +1035,7 @@ def _headline(result: dict, profile: str) -> float:
     if profile in ("constraints", "chore"):
         return agg["strict"] or 0.0
     if profile == "main-replay":
-        return agg.get("action_valid") or 0.0
+        return agg.get("action_valid_weighted") or 0.0
     return (agg["prompted"] or {}).get("right_tool") or 0.0
 
 
@@ -993,7 +1050,7 @@ def format_thinking_gap(label: str, per_mode: dict, profile: str,
     off, on = per_mode["no-think"], per_mode["think"]
     gap = _headline(on, profile) - _headline(off, profile)
     metric = ("strict" if profile in ("constraints", "chore")
-              else "action_valid" if profile == "main-replay"
+              else "action_valid_weighted" if profile == "main-replay"
               else "right_tool")
     t_off = tokens_per_case.get("no-think") or 0.0
     t_on = tokens_per_case.get("think") or 0.0

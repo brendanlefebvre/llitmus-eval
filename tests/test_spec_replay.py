@@ -219,13 +219,13 @@ class TestActedOk:
 class TestWellFormed:
     def test_well_formed_passes(self):
         case = _replay_case("x", acted=True)
-        parsed = ParsedCall(True, "read", {"filePath": "f"}, "ok")
+        parsed = ParsedCall(True, "read", {"filePath": "f"}, "ok", attempted=True)
         s = score_replay_call(parsed, case, [READ_TOOL])
         assert s["well_formed"] is True
 
     def test_not_well_formed_fails(self):
         case = _replay_case("x", acted=True)
-        parsed = ParsedCall(False, None, None, "truncated")
+        parsed = ParsedCall(False, None, None, "truncated", attempted=True)
         s = score_replay_call(parsed, case, [READ_TOOL])
         assert s["well_formed"] is False
 
@@ -243,11 +243,11 @@ class TestToolExists:
         s = score_replay_call(parsed, case, [READ_TOOL])
         assert s["tool_exists"] is False
 
-    def test_no_tool_call_is_vacuously_true(self):
+    def test_no_tool_call_is_not_applicable(self):
         case = _replay_case("x", acted=False)
         parsed = ParsedCall(True, None, None, "abstain")
         s = score_replay_call(parsed, case, [READ_TOOL])
-        assert s["tool_exists"] is True
+        assert s["tool_exists"] is None
 
 
 class TestArgsSchema:
@@ -306,16 +306,18 @@ class TestArgsSchema:
         parsed = ParsedCall(True, None, None, "abstain")
         s = score_replay_call(parsed, case, [READ_TOOL])
         assert s["args_schema_ok"] is None
-        assert s["action_valid"] is True  # acted_ok + well_formed
+        assert s["action_valid"] is True  # acted_ok only (well_formed is N/A)
 
 
 class TestClosedGuard:
-    def test_unclosed_thinking_all_false(self):
+    def test_unclosed_thinking_none_shape(self):
         case = _replay_case("x", acted=True)
         parsed = ParsedCall(True, "read", {"filePath": "f"}, "ok", attempted=True)
         s = score_replay_call(parsed, case, [READ_TOOL], closed=False)
-        assert s == {"acted_ok": False, "well_formed": False,
-                     "tool_exists": False, "args_schema_ok": False,
+        # acted_ok is False (it did not act); remaining dimensions are None
+        # (nothing was produced to check) per the dimension-applicability rule.
+        assert s == {"acted_ok": False, "well_formed": None,
+                     "tool_exists": None, "args_schema_ok": None,
                      "action_valid": False}
 
 
@@ -344,6 +346,67 @@ class TestActionValidComposition:
         parsed = ParsedCall(True, None, None, "abstain")
         s = score_replay_call(parsed, case, [READ_TOOL])
         assert s["action_valid"] is True
+
+
+class TestDimensionApplicability:
+    """None, never False, for not-applicable dimensions (spec 2026-07-28)."""
+
+    def test_malformed_attempted_call_vs_prose_reference(self):
+        """ParsedCall(well_formed=False, attempted=True) vs prose reference.
+
+        The model TRIED to make a call but failed. acted_ok=False (reference
+        didn't act), well_formed=False (meaningful — it tried and failed),
+        tool_exists/args_schema_ok=None (no well-formed call to check).
+        """
+        case = _replay_case("x", acted=False)
+        parsed = ParsedCall(False, None, None, "garbled", attempted=True)
+        s = score_replay_call(parsed, case, [READ_TOOL])
+        assert s["acted_ok"] is False
+        assert s["well_formed"] is False
+        assert s["tool_exists"] is None
+        assert s["args_schema_ok"] is None
+        assert s["action_valid"] is False
+
+    def test_prose_response_vs_acted_reference(self):
+        """Prose response (not attempted) vs acted reference.
+
+        acted_ok=False (should have acted), well_formed=None (not applicable —
+        no action to parse), tool_exists/args_schema_ok=None.
+        """
+        case = _replay_case("x", acted=True)
+        parsed = ParsedCall(True, None, None, "abstain")  # attempted=False
+        s = score_replay_call(parsed, case, [READ_TOOL])
+        assert s["acted_ok"] is False
+        assert s["well_formed"] is None
+        assert s["tool_exists"] is None
+        assert s["args_schema_ok"] is None
+        assert s["action_valid"] is False
+
+    def test_correct_prose_abstention_all_dims_none(self):
+        """Correct prose abstention: acted_ok=True, all others None."""
+        case = _replay_case("x", acted=False)
+        parsed = ParsedCall(True, None, None, "abstain")  # attempted=False
+        s = score_replay_call(parsed, case, [READ_TOOL])
+        assert s["acted_ok"] is True
+        assert s["well_formed"] is None
+        assert s["tool_exists"] is None
+        assert s["args_schema_ok"] is None
+        assert s["action_valid"] is True
+
+    def test_malformed_attempted_call_vs_acted_reference(self):
+        """Attempted-but-failed call vs acted reference.
+
+        acted_ok=True (model tried to act when it should), well_formed=False
+        (meaningful — it tried and failed), tool_exists/args_schema_ok=None.
+        """
+        case = _replay_case("x", acted=True)
+        parsed = ParsedCall(False, None, None, "garbled", attempted=True)
+        s = score_replay_call(parsed, case, [READ_TOOL])
+        assert s["acted_ok"] is True
+        assert s["well_formed"] is False
+        assert s["tool_exists"] is None
+        assert s["args_schema_ok"] is None
+        assert s["action_valid"] is False
 
 
 # ===========================================================================
@@ -406,12 +469,13 @@ class TestAggregateReplay:
         ]
         agg = aggregate_replay(per_case)
         assert agg["n_cases"] == 3
-        assert agg["action_valid"] == 1 / 3
-        assert agg["by_dimension"]["acted_ok"] == 2 / 3
-        assert agg["by_dimension"]["well_formed"] == 1.0
-        assert agg["by_dimension"]["tool_exists"] == 2 / 3
+        # weighted: mid=0.5*0.383 + deep=0.0*0.542 = 0.1915
+        assert agg["action_valid_weighted"] == pytest.approx(0.1915)
+        assert agg["by_dimension"]["acted_ok"] == {"rate": 2 / 3, "n_applicable": 3}
+        assert agg["by_dimension"]["well_formed"] == {"rate": 1.0, "n_applicable": 3}
+        assert agg["by_dimension"]["tool_exists"] == {"rate": 2 / 3, "n_applicable": 3}
         # args_schema_ok: one None excluded, two True => 2/2 = 1.0
-        assert agg["by_dimension"]["args_schema_ok"] == 1.0
+        assert agg["by_dimension"]["args_schema_ok"] == {"rate": 1.0, "n_applicable": 2}
 
     def test_aggregate_by_depth(self):
         per_case = [
@@ -426,6 +490,46 @@ class TestAggregateReplay:
         assert agg["by_depth"]["mid"] == {"action_valid": 1.0, "n": 2}
         assert agg["by_depth"]["deep"] == {"action_valid": 0.0, "n": 1}
 
+    def test_aggregate_by_chain(self):
+        per_case = [
+            {"action_valid": True, "depth_stratum": "mid", "chain_id": "chain-01"},
+            {"action_valid": False, "depth_stratum": "mid", "chain_id": "chain-01"},
+            {"action_valid": True, "depth_stratum": "deep", "chain_id": "chain-02"},
+        ]
+        agg = aggregate_replay(per_case)
+        assert agg["by_chain"]["chain-01"] == {"action_valid": 0.5, "n": 2}
+        assert agg["by_chain"]["chain-02"] == {"action_valid": 1.0, "n": 1}
+
+    def test_aggregate_reference_model_default(self):
+        per_case = [{"action_valid": True, "depth_stratum": "mid"}]
+        agg = aggregate_replay(per_case)
+        assert agg["reference_model"] == "z-ai/glm-5.2"
+
+    def test_aggregate_reference_model_from_case(self):
+        per_case = [{"action_valid": True, "depth_stratum": "mid",
+                     "reference_model": "mlx-community/Qwen3-14B-4bit"}]
+        agg = aggregate_replay(per_case)
+        assert agg["reference_model"] == "mlx-community/Qwen3-14B-4bit"
+
+    def test_aggregate_dimension_denominators(self):
+        """Pin per-dimension n_applicable: None values excluded from denominators."""
+        per_case = [
+            # acted_ok: T, well_formed: None, tool_exists: None, args_schema: None
+            {"acted_ok": True, "well_formed": None, "tool_exists": None,
+             "args_schema_ok": None, "action_valid": True, "depth_stratum": "mid"},
+            # acted_ok: T, well_formed: T, tool_exists: T, args_schema: T
+            {"acted_ok": True, "well_formed": True, "tool_exists": True,
+             "args_schema_ok": True, "action_valid": True, "depth_stratum": "mid"},
+            # acted_ok: F, well_formed: F, tool_exists: None, args_schema: None
+            {"acted_ok": False, "well_formed": False, "tool_exists": None,
+             "args_schema_ok": None, "action_valid": False, "depth_stratum": "deep"},
+        ]
+        agg = aggregate_replay(per_case)
+        assert agg["by_dimension"]["acted_ok"] == {"rate": 2 / 3, "n_applicable": 3}
+        assert agg["by_dimension"]["well_formed"] == {"rate": 1 / 2, "n_applicable": 2}
+        assert agg["by_dimension"]["tool_exists"] == {"rate": 1.0, "n_applicable": 1}
+        assert agg["by_dimension"]["args_schema_ok"] == {"rate": 1.0, "n_applicable": 1}
+
     def test_aggregate_depth_weights_present(self):
         agg = aggregate_replay([])
         assert agg["depth_weights"] == {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
@@ -433,17 +537,17 @@ class TestAggregateReplay:
     def test_aggregate_empty(self):
         agg = aggregate_replay([])
         assert agg["n_cases"] == 0
-        assert agg["action_valid"] == 0.0
+        assert agg["action_valid_weighted"] == 0.0
         for s in ("shallow", "mid", "deep"):
             assert agg["by_depth"][s] == {"action_valid": 0.0, "n": 0}
 
-    def test_aggregate_args_schema_all_none_is_none(self):
+    def test_aggregate_args_schema_all_none(self):
         per_case = [
             {"acted_ok": True, "well_formed": True, "tool_exists": True,
              "args_schema_ok": None, "action_valid": True, "depth_stratum": "mid"},
         ]
         agg = aggregate_replay(per_case)
-        assert agg["by_dimension"]["args_schema_ok"] is None
+        assert agg["by_dimension"]["args_schema_ok"] == {"rate": None, "n_applicable": 0}
 
 
 # ===========================================================================
@@ -533,7 +637,7 @@ class TestRunMainReplay:
         assert score["action_valid"] is True
         # max_tokens comes from the captured body, not the CLI
         assert seen["max_tokens"] == 32000
-        assert result["aggregate"]["action_valid"] == 1.0
+        assert result["aggregate"]["by_depth"]["mid"]["action_valid"] == 1.0
 
     def test_prompted_runner_prose_when_ref_prose(self, tmp_path):
         msgs = [{"role": "user", "content": "what is 2+2"}]
@@ -542,15 +646,15 @@ class TestRunMainReplay:
         case = _replay_case(cap, acted=False)
         tok = ReplayFakeTokenizer()
         # model responds in prose: no JSON object -> parse_prompted returns
-        # well_formed False, tool None. acted_ok True (no call). A correct
-        # abstention is itself well-formed (mirrors score_tool_call's native
-        # abstention handling), so well_formed True and action_valid True.
+        # well_formed=False, tool=None, attempted=False. A correct abstention:
+        # acted_ok=True (ref didn't act, candidate didn't attempt). Dimensions
+        # for the action itself are not applicable (None).
         result = run_main_replay([case], tok,
                                  lambda p, max_tokens=0: "The answer is 4.",
                                  native=False)
         score = result["cases"][0]["score"]
         assert score["acted_ok"] is True   # ref didn't act, candidate didn't act
-        assert score["well_formed"] is True  # correct abstention is well-formed
+        assert score["well_formed"] is None  # not applicable (no action to parse)
         assert score["action_valid"] is True
 
     def test_native_runner_correct_call(self, tmp_path):
@@ -605,7 +709,7 @@ class TestRunMainReplay:
         score = rec["score"]
         assert score["action_valid"] is False
         assert score["acted_ok"] is False
-        assert score["well_formed"] is False
+        assert score["well_formed"] is None  # nothing produced to check
 
     def test_runner_records_error(self, tmp_path):
         cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
@@ -646,9 +750,11 @@ class TestRunMainReplay:
         result = run_main_replay(cases, tok, gen, native=False)
         agg = result["aggregate"]
         assert agg["n_cases"] == 3
-        assert agg["action_valid"] == 2 / 3
+        # shallow: 2/2 pass, mid: 0/1 pass
         assert agg["by_depth"]["shallow"] == {"action_valid": 1.0, "n": 2}
         assert agg["by_depth"]["mid"] == {"action_valid": 0.0, "n": 1}
+        # weighted: 1.0*0.075 + 0.0*0.383 = 0.075
+        assert agg["action_valid_weighted"] == pytest.approx(0.075)
 
 
 # ===========================================================================
@@ -658,30 +764,38 @@ class TestRunMainReplay:
 class TestFormatReplayTable:
     def test_table_shows_action_valid_and_dimensions(self):
         result = {"aggregate": {
-            "action_valid": 0.67, "n_cases": 3,
-            "by_dimension": {"acted_ok": 1.0, "well_formed": 0.67,
-                             "tool_exists": 0.67, "args_schema_ok": 0.5},
+            "action_valid_weighted": 0.19, "n_cases": 3,
+            "by_dimension": {"acted_ok": {"rate": 1.0, "n_applicable": 3},
+                             "well_formed": {"rate": 0.67, "n_applicable": 3},
+                             "tool_exists": {"rate": 0.67, "n_applicable": 3},
+                             "args_schema_ok": {"rate": 0.5, "n_applicable": 2}},
             "by_depth": {"shallow": {"action_valid": 1.0, "n": 1},
                          "mid": {"action_valid": 0.5, "n": 2},
                          "deep": {"action_valid": 0.0, "n": 0}},
+            "by_chain": {"chain-01": {"action_valid": 0.5, "n": 2}},
+            "reference_model": "z-ai/glm-5.2",
             "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
         }, "cases": [], "errored": []}
         table = format_replay_table("Qwen", result)
         assert "Qwen" in table
         assert "action_valid" in table
-        assert "0.67" in table
+        assert "0.19" in table
         assert "by dimension" in table
         assert "by depth" in table
         assert "shallow" in table and "mid" in table and "deep" in table
 
     def test_table_handles_none_dimension(self):
         result = {"aggregate": {
-            "action_valid": 0.0, "n_cases": 1,
-            "by_dimension": {"acted_ok": None, "well_formed": None,
-                             "tool_exists": None, "args_schema_ok": None},
+            "action_valid_weighted": 0.0, "n_cases": 1,
+            "by_dimension": {"acted_ok": {"rate": None, "n_applicable": 0},
+                             "well_formed": {"rate": None, "n_applicable": 0},
+                             "tool_exists": {"rate": None, "n_applicable": 0},
+                             "args_schema_ok": {"rate": None, "n_applicable": 0}},
             "by_depth": {"shallow": {"action_valid": 0.0, "n": 0},
                          "mid": {"action_valid": 0.0, "n": 1},
                          "deep": {"action_valid": 0.0, "n": 0}},
+            "by_chain": {},
+            "reference_model": "z-ai/glm-5.2",
             "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
         }, "cases": [], "errored": [{"id": "x", "error": "boom"}]}
         table = format_replay_table("M", result)
@@ -689,10 +803,14 @@ class TestFormatReplayTable:
 
     def test_table_with_empty_depth(self):
         result = {"aggregate": {
-            "action_valid": 1.0, "n_cases": 1,
-            "by_dimension": {"acted_ok": 1.0, "well_formed": 1.0,
-                             "tool_exists": 1.0, "args_schema_ok": 1.0},
+            "action_valid_weighted": 0.383, "n_cases": 1,
+            "by_dimension": {"acted_ok": {"rate": 1.0, "n_applicable": 1},
+                             "well_formed": {"rate": 1.0, "n_applicable": 1},
+                             "tool_exists": {"rate": 1.0, "n_applicable": 1},
+                             "args_schema_ok": {"rate": 1.0, "n_applicable": 1}},
             "by_depth": {},
+            "by_chain": {},
+            "reference_model": "z-ai/glm-5.2",
             "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
         }, "cases": [], "errored": []}
         table = format_replay_table("M", result)
@@ -714,5 +832,5 @@ class TestLoadAndRun:
         tok = ReplayFakeTokenizer()
         gen = lambda p, max_tokens=0: '{"tool": "read", "arguments": {"filePath": "f"}}'
         result = run_main_replay(cases, tok, gen, native=False)
-        assert result["aggregate"]["action_valid"] == 1.0
+        assert result["aggregate"]["by_depth"]["mid"]["action_valid"] == 1.0
         assert result["aggregate"]["n_cases"] == 1
