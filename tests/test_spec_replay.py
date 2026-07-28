@@ -591,7 +591,10 @@ class TestBuildReplayPrompt:
         tok = ReplayFakeTokenizer()
         build_replay_prompt(tok, case, native=False)
         assert tok.last_tools is None
-        assert tok.last_messages == msgs
+        # Original messages preserved, convention appended after
+        assert tok.last_messages[:2] == msgs
+        assert tok.last_messages[-1]["role"] == "system"
+        assert "tool" in tok.last_messages[-1]["content"]
 
     def test_enable_thinking_forwarded(self, tmp_path):
         cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
@@ -599,6 +602,58 @@ class TestBuildReplayPrompt:
         tok = ReplayFakeTokenizer()
         build_replay_prompt(tok, case, native=True, enable_thinking=False)
         assert tok.last_enable_thinking is False
+
+    def test_prompted_appends_convention_with_schemas(self, tmp_path):
+        """Non-native prompt contains _PROMPTED_SYSTEM text and tool schemas."""
+        from litmus_spec import _PROMPTED_SYSTEM
+        msgs = [{"role": "system", "content": "sys"},
+                {"role": "user", "content": "do it"}]
+        cap = _make_capture(tmp_path, "req-1.json", messages=msgs,
+                            tools=[READ_TOOL, GREP_TOOL])
+        case = _replay_case(cap)
+        tok = ReplayFakeTokenizer()
+        prompt = build_replay_prompt(tok, case, native=False)
+        # The convention text (minus the {schemas} placeholder) is present
+        convention_head = _PROMPTED_SYSTEM.split("{schemas}")[0]
+        assert convention_head in prompt
+        # Tool names appear in the serialized schemas
+        assert '"read"' in prompt
+        assert '"grep"' in prompt
+        # The last message passed to the tokenizer is the convention system msg
+        last_msg = tok.last_messages[-1]
+        assert last_msg["role"] == "system"
+        assert convention_head in last_msg["content"]
+
+    def test_native_byte_verbatim_no_convention(self, tmp_path):
+        """Native prompt is exactly _chat(messages, tools=captured_tools)."""
+        from litmus_spec import _chat, _PROMPTED_SYSTEM
+        msgs = [{"role": "system", "content": "sys"},
+                {"role": "user", "content": "do it"}]
+        cap = _make_capture(tmp_path, "req-1.json", messages=msgs,
+                            tools=[READ_TOOL])
+        case = _replay_case(cap)
+        tok = ReplayFakeTokenizer()
+        prompt = build_replay_prompt(tok, case, native=True)
+        expected = _chat(tok, msgs, tools=[READ_TOOL])
+        assert prompt == expected
+        # No convention message appended
+        convention_head = _PROMPTED_SYSTEM.split("{schemas}")[0]
+        assert convention_head not in prompt
+        assert tok.last_messages == msgs
+
+    def test_prompted_does_not_mutate_captured_messages(self, tmp_path):
+        """After build_replay_prompt, the capture file's messages are unchanged."""
+        msgs = [{"role": "system", "content": "sys"},
+                {"role": "user", "content": "do it"}]
+        cap = _make_capture(tmp_path, "req-1.json", messages=msgs,
+                            tools=[READ_TOOL])
+        case = _replay_case(cap)
+        tok = ReplayFakeTokenizer()
+        build_replay_prompt(tok, case, native=False)
+        # Re-read the capture file — messages must be untouched
+        with open(cap, encoding="utf-8") as f:
+            body = json.load(f)
+        assert body["messages"] == msgs
 
 
 # ===========================================================================

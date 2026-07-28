@@ -424,6 +424,10 @@ def _call_from_name_obj(obj: Optional[dict], detail: str,
 
 
 def parse_native(text: str) -> ParsedCall:
+    # TODO: Only recognises JSON inside the tool_call tag pair and the
+    # python_tag marker. The function=/parameter= XML family used by some
+    # serving harnesses is not parsed. Moot for increment 1 (no model runs
+    # native), but needs addressing before native replay.
     if not text.strip():
         return ParsedCall(False, None, None, "truncated")
     m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL)
@@ -813,20 +817,32 @@ def build_constraint_prompt(tokenizer, case: "ConstraintCase",
 
 def build_replay_prompt(tokenizer, case: "ReplayCase", native: bool,
                         enable_thinking=None) -> str:
-    """Build the prompt from the captured request body, verbatim by reference.
+    """Build the prompt from the captured request body.
 
     The prompt IS the captured request: its messages array (which already
     contains the session's system prompt) is applied to the chat template
-    directly. For native mode the captured `tools` array is forwarded; for
-    prompted mode no tools are passed (the model relies on the system prompt
-    already in the messages to learn the tool format). No synthetic system
-    prompt is injected — the case is the request.
+    directly. For native mode the captured `tools` array is forwarded
+    byte-verbatim. For prompted mode the ``_PROMPTED_SYSTEM`` convention
+    plus the request's own tool schemas are appended as a final system
+    message — the sole deliberate deviation from body-verbatim — so the
+    model sees the JSON shape it is graded on (spec, 2026-07-28).
     """
     with open(case.capture_path, encoding="utf-8") as f:
         body = json.load(f)
     messages = body["messages"]
-    tools = body.get("tools") if native else None
-    return _chat(tokenizer, messages, tools=tools,
+    if native:
+        tools = body.get("tools")
+        return _chat(tokenizer, messages, tools=tools,
+                     enable_thinking=enable_thinking)
+    # Non-native: append the prompted convention + tool schemas as a
+    # final system message so the model sees the format it is graded on.
+    # Sole deviation from body-verbatim (spec, 2026-07-28).
+    tools = body.get("tools") or []
+    schemas = json.dumps(tools, indent=2)
+    convention = _PROMPTED_SYSTEM.format(schemas=schemas)
+    messages = list(messages)  # don't mutate the captured list
+    messages.append({"role": "system", "content": convention})
+    return _chat(tokenizer, messages, tools=None,
                  enable_thinking=enable_thinking)
 
 
