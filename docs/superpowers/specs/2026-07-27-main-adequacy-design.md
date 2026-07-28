@@ -226,11 +226,12 @@ with aggregate:
 
 (Values illustrative. **Weights are computed by the extractor on every corpus
 walk** — the observed in-scope usable-pair distribution — and persisted in the
-case file's `.meta.json` sibling, which the runner consumes; the 2026-07-27
-measurement (0.075/0.383/0.542, from 9/46/65 over 120 captures) survives only
-as a fallback for case files without a meta sidecar, and
-`depth_weights_source` labels which was used so a stale-weights run is always
-visible.) Equal-N sampling per stratum is correct for measuring the
+case file's `.meta.json` sibling, which the runner consumes. There is no
+static fallback: a case file without usable meta weights reports
+`action_valid_weighted: null` with `depth_weights_source: "missing"` — the
+applicability rule applied to the headline itself. A number we cannot compute
+is `null`, never a stale stand-in; `by_depth` still carries the per-stratum
+rates, which are the actual data.) Equal-N sampling per stratum is correct for measuring the
 depth *curve* — equal precision per point — but a pooled rate over an equal-N
 sample would describe a traffic mix that does not exist. So the sidecar reports
 **`action_valid_weighted`** — per-stratum rates weighted by the observed

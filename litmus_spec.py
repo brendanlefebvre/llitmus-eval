@@ -651,19 +651,14 @@ def score_replay_call(parsed: "ParsedCall", case: "ReplayCase",
             "action_valid": action_valid}
 
 
-# Fallback only: the in-scope depth distribution measured 2026-07-27
-# (9/46/65 over 120 captures). The extractor writes the distribution it
-# actually observed into the case file's .meta.json sibling, and that is
-# what a run should use — see load_replay_meta().
-_FALLBACK_DEPTH_WEIGHTS = {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
-
-
 def load_replay_meta(cases_path: str) -> dict | None:
     """Read the extractor's ``<stem>.meta.json`` sibling of a case file.
 
     Returns the meta dict when present and its depth_weights are usable
-    (strata keys, numeric values, positive sum), else None — callers fall
-    back to _FALLBACK_DEPTH_WEIGHTS and the sidecar labels the source.
+    (strata keys, numeric values, positive sum), else None — and with no
+    weights the aggregate reports action_valid_weighted as None with
+    depth_weights_source "missing", per the applicability rule: a number we
+    cannot compute is None, never a stale stand-in.
     """
     meta_path = os.path.splitext(cases_path)[0] + ".meta.json"
     try:
@@ -673,7 +668,7 @@ def load_replay_meta(cases_path: str) -> dict | None:
         return None
     weights = meta.get("depth_weights")
     if (isinstance(weights, dict)
-            and set(weights) <= set(_FALLBACK_DEPTH_WEIGHTS)
+            and set(weights) <= set(_REPLAY_STRATA)
             and all(isinstance(v, (int, float)) and not isinstance(v, bool)
                     and v >= 0 for v in weights.values())
             and sum(weights.values()) > 0):
@@ -721,19 +716,25 @@ def aggregate_replay(per_case: list, depth_weights: dict | None = None) -> dict:
     # renormalized over the weight actually present. Coverage is reported
     # alongside so consumers can see how much of the mix the number spans.
     if depth_weights is None:
-        weights_used = _FALLBACK_DEPTH_WEIGHTS
-        weights_source = "fallback-2026-07-27"
+        # No observed weights: the weighted headline is not computable.
+        # None, never a stale stand-in — the same applicability rule the
+        # per-case dimensions follow.
+        action_valid_weighted = None
+        weight_present = None
+        weights_used = None
+        weights_source = "missing"
     else:
         weights_used = depth_weights
         weights_source = "corpus-meta"
-    weighted_sum = 0.0
-    weight_present = 0.0
-    for stratum, weight in weights_used.items():
-        d = by_depth.get(stratum) or {}
-        if d.get("n", 0):
-            weighted_sum += d["action_valid"] * weight
-            weight_present += weight
-    action_valid_weighted = (weighted_sum / weight_present) if weight_present else 0.0
+        weighted_sum = 0.0
+        weight_present = 0.0
+        for stratum, weight in weights_used.items():
+            d = by_depth.get(stratum) or {}
+            if d.get("n", 0):
+                weighted_sum += d["action_valid"] * weight
+                weight_present += weight
+        action_valid_weighted = (
+            (weighted_sum / weight_present) if weight_present else 0.0)
 
     by_chain: dict = {}
     for c in per_case:
@@ -764,7 +765,7 @@ def aggregate_replay(per_case: list, depth_weights: dict | None = None) -> dict:
         "by_depth": by_depth,
         "by_chain": by_chain,
         "reference_model": reference_model,
-        "depth_weights": dict(weights_used),
+        "depth_weights": dict(weights_used) if weights_used else None,
         "depth_weights_source": weights_source,
         "n_cases": n_cases,
     }
@@ -1101,9 +1102,11 @@ def format_constraint_table(label: str, result: dict) -> str:
 
 def format_replay_table(label: str, result: dict) -> str:
     agg = result["aggregate"]
+    avw = agg.get("action_valid_weighted")
     headline = (f"{label}:  action_valid_weighted="
-                f"{agg.get('action_valid_weighted', 0.0):.2f}  "
-                f"(n={agg['n_cases']})")
+                + (f"{avw:.2f}" if avw is not None
+                   else "n/a (weights missing)")
+                + f"  (n={agg['n_cases']})")
     coverage = agg.get("depth_weight_coverage")
     if coverage is not None and coverage < 1.0:
         # The renormalized headline only speaks for the strata that have
@@ -1140,7 +1143,8 @@ def _headline(result: dict, profile: str) -> float:
     if profile in ("constraints", "chore"):
         return agg["strict"] or 0.0
     if profile == "main-replay":
-        return agg.get("action_valid_weighted") or 0.0
+        # May be None when depth weights were missing; callers must guard.
+        return agg.get("action_valid_weighted")
     return (agg["prompted"] or {}).get("right_tool") or 0.0
 
 
@@ -1153,7 +1157,7 @@ def format_thinking_gap(label: str, per_mode: dict, profile: str,
     on the line.
     """
     off, on = per_mode["no-think"], per_mode["think"]
-    gap = _headline(on, profile) - _headline(off, profile)
+    h_off, h_on = _headline(off, profile), _headline(on, profile)
     metric = ("strict" if profile in ("constraints", "chore")
               else "action_valid_weighted" if profile == "main-replay"
               else "right_tool")
@@ -1162,9 +1166,11 @@ def format_thinking_gap(label: str, per_mode: dict, profile: str,
     cost = f"{t_off:.0f} -> {t_on:.0f} tok/case"
     if t_off > 0:
         cost += f" ({t_on / t_off:.1f}x)"
-    return (f"{label}: thinking gap({metric})={gap:+.2f}  "
-            f"[no-think={_headline(off, profile):.2f}  "
-            f"think={_headline(on, profile):.2f}]  cost: {cost}")
+    if h_off is None or h_on is None:
+        return (f"{label}: thinking gap({metric})=n/a (weights missing)  "
+                f"cost: {cost}")
+    return (f"{label}: thinking gap({metric})={h_on - h_off:+.2f}  "
+            f"[no-think={h_off:.2f}  think={h_on:.2f}]  cost: {cost}")
 
 
 def write_sidecar(path: str, profile: str, model: str, label: str,
@@ -1274,8 +1280,9 @@ def main() -> None:
             replay_weights = replay_meta["depth_weights"]
             print(f"depth weights from corpus meta: {replay_weights}")
         else:
-            print("no usable .meta.json beside case file — using fallback "
-                  f"depth weights {_FALLBACK_DEPTH_WEIGHTS} (measured 2026-07-27)")
+            print("no usable .meta.json beside case file — depth weights "
+                  "missing, action_valid_weighted will be null "
+                  "(depth_weights_source=missing)")
 
     backend = get_backend(args.backend)
     for label, repo in _targets_for(args):

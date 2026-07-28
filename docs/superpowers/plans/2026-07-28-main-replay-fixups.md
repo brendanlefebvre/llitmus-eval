@@ -237,8 +237,9 @@ both noted in code/docstrings, neither blocks the increment-1 model set.
    in-scope usable-pair distribution on every walk
    (`depth_weights_from_population`), persists it (plus
    `population_by_stratum`) in `main_replay.meta.json`, and the runner
-   consumes it via `load_replay_meta`; the 2026-07-27 constant is demoted to
-   a labeled fallback and the sidecar carries `depth_weights_source`
-   ("corpus-meta" | "fallback-2026-07-27"). Measured drift that motivated
+   consumes it via `load_replay_meta`; the 2026-07-27 constant is removed
+   entirely: missing weights yield `action_valid_weighted: null` with
+   `depth_weights_source: "missing"` (owner directive — the applicability
+   rule applied to the headline; formatters render "n/a (weights missing)"). Measured drift that motivated
    this: 0.075/0.383/0.542 (07-27, 120 pairs) vs 0.129/0.397/0.473 (07-28,
    224 pairs).

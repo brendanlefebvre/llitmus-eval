@@ -15,6 +15,10 @@ from litmus_spec import (
 TC_OPEN = chr(60) + chr(60) + "tool_call" + chr(62)
 TC_CLOSE = chr(60) + chr(47) + "tool_call" + chr(62)
 
+# Explicit weights for tests that assert weighted-headline arithmetic —
+# aggregate_replay has no fallback (missing weights -> None headline).
+_W = {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
+
 
 # ---------------------------------------------------------------------------
 # capture / case fixtures
@@ -467,7 +471,7 @@ class TestAggregateReplay:
             {"acted_ok": False, "well_formed": True, "tool_exists": True,
              "args_schema_ok": True, "action_valid": False, "depth_stratum": "deep"},
         ]
-        agg = aggregate_replay(per_case)
+        agg = aggregate_replay(per_case, depth_weights=_W)
         assert agg["n_cases"] == 3
         # weighted, renormalized over present strata (no shallow cases):
         # (mid=0.5*0.383 + deep=0.0*0.542) / (0.383 + 0.542)
@@ -552,10 +556,17 @@ class TestAggregateReplay:
         assert agg["by_dimension"]["tool_exists"] == {"rate": 1.0, "n_applicable": 1}
         assert agg["by_dimension"]["args_schema_ok"] == {"rate": 1.0, "n_applicable": 1}
 
-    def test_aggregate_depth_weights_present(self):
-        agg = aggregate_replay([])
-        assert agg["depth_weights"] == {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
-        assert agg["depth_weights_source"] == "fallback-2026-07-27"
+    def test_aggregate_missing_weights_is_none_not_stale(self):
+        """No observed weights -> the weighted headline is None with source
+        "missing", mirroring the dimension-applicability rule. by_depth (the
+        actual data) is still reported."""
+        agg = aggregate_replay([{"action_valid": True,
+                                 "depth_stratum": "shallow"}])
+        assert agg["action_valid_weighted"] is None
+        assert agg["depth_weight_coverage"] is None
+        assert agg["depth_weights"] is None
+        assert agg["depth_weights_source"] == "missing"
+        assert agg["by_depth"]["shallow"] == {"action_valid": 1.0, "n": 1}
 
     def test_aggregate_honors_corpus_weights(self):
         """Explicit weights (from the extractor's meta) override the fallback,
@@ -609,18 +620,18 @@ class TestAggregateReplay:
             {"action_valid": True, "depth_stratum": "mid"},
             {"action_valid": True, "depth_stratum": "deep"},
         ]
-        agg = aggregate_replay(all_strata)
+        agg = aggregate_replay(all_strata, depth_weights=_W)
         assert agg["depth_weight_coverage"] == pytest.approx(1.0)
         assert agg["action_valid_weighted"] == pytest.approx(1.0)
 
         shallow_only = [{"action_valid": True, "depth_stratum": "shallow"}]
-        agg = aggregate_replay(shallow_only)
+        agg = aggregate_replay(shallow_only, depth_weights=_W)
         assert agg["depth_weight_coverage"] == pytest.approx(0.075)
         assert agg["depth_weight_coverage"] < 1.0
         assert agg["action_valid_weighted"] == pytest.approx(1.0)
 
     def test_aggregate_empty(self):
-        agg = aggregate_replay([])
+        agg = aggregate_replay([], depth_weights=_W)
         assert agg["n_cases"] == 0
         assert agg["action_valid_weighted"] == 0.0
         assert agg["depth_weight_coverage"] == 0.0
@@ -893,7 +904,8 @@ class TestRunMainReplay:
         def gen(p, max_tokens=0):
             return next(outs)
 
-        result = run_main_replay(cases, tok, gen, native=False)
+        result = run_main_replay(cases, tok, gen, native=False,
+                                 depth_weights=_W)
         agg = result["aggregate"]
         assert agg["n_cases"] == 3
         # shallow: 2/2 pass, mid: 0/1 pass
