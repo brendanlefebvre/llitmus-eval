@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Extract main-replay eval cases from Loxo capture files.
 
-Walks the captures directory, groups files into prefix chains by per-message
-hashing, applies skip rules, assigns depth strata, samples 15 cases (5 per
-stratum from at least two chains), and emits JSONL to cases/main_replay.jsonl.
+Walks the captures directory, filters to ``main``-class captures, groups files
+into prefix chains by per-message hashing, applies skip rules, assigns depth
+strata, samples up to 15 cases (5 per stratum), drawn from multiple chains when
+available, and emits JSONL to cases/main_replay.jsonl.
 
 Captures are successive snapshots of growing conversations — consecutive
 captures in a prefix chain represent (state, known-good-action) pairs. The
@@ -21,7 +22,7 @@ import os
 import pathlib
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from loxo_llm_router import (
     classify,
@@ -39,6 +40,11 @@ STRATA = ("shallow", "mid", "deep")
 ADEQUACY_LEDGER = pathlib.Path(
     os.path.expanduser("~/.local/state/loxo-llm-router/adequacy.jsonl")
 )
+
+# The model that authored the captured reference turns. Sourced here (not
+# hardcoded in litmus_spec) so the runner/sidecar can read it from the case
+# file. Matches the increment-1 reference per the adequacy design spec.
+REFERENCE_MODEL = "z-ai/glm-5.2"
 
 FILENAME_TS_RE = re.compile(r"req-(\d{8}T\d{6}\.\d+)-\d+\.json")
 
@@ -115,7 +121,14 @@ def parse_capture_ts(name: str) -> datetime | None:
         return None
 
 
-def load_qwen_timestamps(ledger_path: pathlib.Path) -> list[str]:
+def load_qwen_timestamps(ledger_path: pathlib.Path) -> list[dict]:
+    """Return Qwen3-14B-served ``main`` ledger entries as dicts.
+
+    Each entry has ``ts`` (ISO string, stamped at response *completion*) and
+    ``latency_ms`` (int or None). Callers must subtract ``latency_ms`` from
+    ``ts`` to recover the request *arrival* time before correlating against
+    capture filename timestamps.
+    """
     if not ledger_path.exists():
         return []
     out = []
@@ -133,28 +146,46 @@ def load_qwen_timestamps(ledger_path: pathlib.Path) -> list[str]:
             continue
         ts = entry.get("ts")
         if ts:
-            out.append(ts)
+            latency = entry.get("latency_ms")
+            out.append({
+                "ts": ts,
+                "latency_ms": int(latency) if latency is not None else None,
+            })
     return out
 
 
-def _ts_within_2s(capture_ts: datetime, ledger_ts_str: str) -> bool:
+def _ts_within_2s(capture_ts: datetime, ledger_ts_str: str,
+                  latency_ms: int | None) -> bool:
+    """Compare a capture arrival ts to a ledger completion ts.
+
+    The ledger ``ts`` is stamped at response completion (arrival + latency).
+    Subtract ``latency_ms`` to recover the true arrival time before comparing.
+    """
     try:
         ledger_ts = datetime.fromisoformat(ledger_ts_str)
         if ledger_ts.tzinfo is not None:
             ledger_ts = ledger_ts.replace(tzinfo=None)
+        if latency_ms is not None:
+            ledger_ts = ledger_ts - timedelta(milliseconds=latency_ms)
         return abs((capture_ts - ledger_ts).total_seconds()) <= 2
     except (ValueError, TypeError):
         return False
 
 
 def is_qwen_authored(capture_name: str,
-                     qwen_timestamps: list[str]) -> str | None:
+                     qwen_entries: list[dict]) -> str | None:
+    """Return the matching ledger ``ts`` if capture N was Qwen3-14B-served.
+
+    ``qwen_entries`` are the dicts from :func:`load_qwen_timestamps`. The
+    returned ts is the ledger's completion ts (preserved for log clarity);
+    correlation uses arrival = ts - latency_ms.
+    """
     capture_ts = parse_capture_ts(capture_name)
     if capture_ts is None:
         return None
-    for ts in qwen_timestamps:
-        if _ts_within_2s(capture_ts, ts):
-            return ts
+    for entry in qwen_entries:
+        if _ts_within_2s(capture_ts, entry["ts"], entry.get("latency_ms")):
+            return entry["ts"]
     return None
 
 
@@ -177,6 +208,14 @@ def assign_stratum(tokens: int, limit: int = LOCAL_CONTEXT_LIMIT) -> str | None:
 # ---------------------------------------------------------------------------
 
 def build_reference(assistant_msg: dict) -> dict | None:
+    """Build the reference action from an assistant turn.
+
+    Returns ``None`` if the turn is malformed (no tool_calls and no content),
+    or if any tool_call's ``arguments`` fail to parse as JSON. The latter
+    signals "skip the pair" rather than silently substituting empty args —
+    tier-1 will consume these arguments in increment 2, so masking malformed
+    JSON would hide a real failure mode.
+    """
     tool_calls = assistant_msg.get("tool_calls")
     if tool_calls:
         tools = []
@@ -189,11 +228,11 @@ def build_reference(assistant_msg: dict) -> dict | None:
                 try:
                     args = json.loads(args_raw)
                 except json.JSONDecodeError:
-                    args = {}
+                    return None  # signal skip in process_pairs
             elif isinstance(args_raw, dict):
                 args = args_raw
             else:
-                args = {}
+                return None  # signal skip in process_pairs
             arguments.append(args)
         return {"acted": True, "tools": tools, "arguments": arguments}
     content = assistant_msg.get("content")
@@ -207,11 +246,13 @@ def build_reference(assistant_msg: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def process_pairs(chains: list[list[dict]],
-                  qwen_timestamps: list[str]) -> list[dict]:
+                  qwen_entries: list[dict]) -> list[dict]:
     usable = []
     for chain_idx, chain in enumerate(chains, 1):
         chain_id = f"chain-{chain_idx:02d}"
         if len(chain) < 2:
+            print(f"SKIP chain {chain_id}: {len(chain)} capture(s) "
+                  f"— no pairs possible", file=sys.stderr)
             continue
         for i in range(len(chain) - 1):
             cap_n = chain[i]
@@ -225,7 +266,8 @@ def process_pairs(chains: list[list[dict]],
                       file=sys.stderr)
                 continue
 
-            # Skip rule 1: non-main captures
+            # Skip rule 1: non-main captures (belt-and-suspenders; the
+            # corpus is already class-filtered before grouping in main()).
             classification = classify(cap_n["body"])
             if classification.cls != "main":
                 print(f"SKIP {cap_n['name']}: class={classification.cls} "
@@ -245,15 +287,23 @@ def process_pairs(chains: list[list[dict]],
 
             ref_msg = cap_n1["body"]["messages"][cap_n["n"]]
 
-            # Skip rule 3: pathological reference turns
+            # Determine whether the reference is malformed (JSONDecodeError on
+            # tool_call arguments) vs pathological (no tool_calls, no
+            # content). build_reference returns None for both; disambiguate
+            # by inspecting ref_msg so the skip reason is accurate.
             ref = build_reference(ref_msg)
             if ref is None:
-                print(f"SKIP {pair_label}: pathological reference "
-                      f"(no tool_calls, no content)", file=sys.stderr)
+                tcs = ref_msg.get("tool_calls")
+                if tcs:
+                    print(f"SKIP {pair_label}: malformed tool_call "
+                          f"arguments (JSONDecodeError)", file=sys.stderr)
+                else:
+                    print(f"SKIP {pair_label}: pathological reference "
+                          f"(no tool_calls, no content)", file=sys.stderr)
                 continue
 
             # Skip rule 4: Qwen3-14B-authored turns
-            qwen_ts = is_qwen_authored(cap_n["name"], qwen_timestamps)
+            qwen_ts = is_qwen_authored(cap_n["name"], qwen_entries)
             if qwen_ts is not None:
                 print(f"SKIP {pair_label}: reference authored by Qwen3-14B "
                       f"(ledger ts={qwen_ts})", file=sys.stderr)
@@ -366,10 +416,28 @@ def main() -> None:
     n_per = args.sample_per_stratum
 
     rows = load_captures(capture_dir)
-    chains = group_chains(rows)
+    # Class-filter before chain grouping: interleaved non-main captures
+    # (chore/compaction) fragment chains because group_chains compares only
+    # consecutive files. The per-pair classify() in process_pairs stays as a
+    # belt-and-suspenders check.
+    main_rows: list[dict] = []
+    for r in rows:
+        cls = classify(r["body"]).cls
+        if cls != "main":
+            print(f"DROP {r['name']}: class={cls} (filtered before grouping)",
+                  file=sys.stderr)
+            continue
+        main_rows.append(r)
+    chains = group_chains(main_rows)
 
-    qwen_ts = load_qwen_timestamps(ADEQUACY_LEDGER)
-    usable = process_pairs(chains, qwen_ts)
+    # Corpus snapshot: record which population this extraction saw. The
+    # captures dir grows over time and nothing else records the file count or
+    # newest ts an extraction was run against.
+    corpus_count = len(rows)
+    newest_name = rows[-1]["name"] if rows else "(none)"
+
+    qwen_entries = load_qwen_timestamps(ADEQUACY_LEDGER)
+    usable = process_pairs(chains, qwen_entries)
 
     pop_by_stratum = {s: 0 for s in STRATA}
     for p in usable:
@@ -385,6 +453,7 @@ def main() -> None:
             "chain_id": case["chain_id"],
             "depth_stratum": case["depth_stratum"],
             "est_tokens": case["est_tokens"],
+            "reference_model": REFERENCE_MODEL,
             "reference": case["reference"],
         })
 
@@ -394,7 +463,10 @@ def main() -> None:
             f.write(json.dumps(case, ensure_ascii=False) + "\n")
 
     # --- Summary (stdout) ---
+    print(f"Corpus snapshot: {corpus_count} captures, newest: {newest_name}")
     print(f"Captures scanned: {len(rows)}")
+    print(f"Main-class captures: {len(main_rows)} "
+          f"({len(rows) - len(main_rows)} non-main dropped)")
     print(f"Chains found: {len(chains)}")
     for i, c in enumerate(chains, 1):
         print(f"  chain-{i:02d}: {len(c)} captures "

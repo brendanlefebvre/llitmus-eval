@@ -233,10 +233,14 @@ class TestSkipRules:
         assert "curl probe" in captured.err
 
     def test_skip_qwen_authored(self, tmp_path, capsys):
-        # Create a capture whose filename timestamp matches a ledger entry
-        # within ±2 seconds.
+        # Create a capture whose filename timestamp matches a ledger entry's
+        # arrival time (ledger ts - latency_ms) within ±2 seconds.
         cap_name = "req-20260727T122717.000000-0003.json"
-        ledger_ts = "2026-07-27T12:27:16.500000+00:00"  # ~0.5s difference
+        # Ledger ts is stamped at completion; subtract latency_ms to recover
+        # the arrival time that should match the capture filename.
+        ledger_ts = "2026-07-27T12:27:16.500000+00:00"  # ~0.5s after capture
+        latency_ms = 0
+        qwen_entries = [{"ts": ledger_ts, "latency_ms": latency_ms}]
 
         msgs_a = [sys_msg(), user_msg()]
         msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
@@ -245,12 +249,55 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [ledger_ts])
+        usable = emr.process_pairs(chains, qwen_entries)
 
         assert len(usable) == 0
         captured = capsys.readouterr()
         assert "Qwen3-14B" in captured.err
         assert ledger_ts in captured.err
+
+    def test_qwen_latency_ms_subtraction(self, tmp_path, capsys):
+        # The ledger ts is stamped at response completion (arrival + latency).
+        # Without subtracting latency_ms, a capture whose arrival is well
+        # before completion would NOT match; with the subtraction it should.
+        # Capture arrival: 12:27:17.000. Ledger completion: 12:27:19.500.
+        # latency_ms = 2500 → arrival = 12:27:17.000 → matches exactly.
+        cap_name = "req-20260727T122717.000000-0003.json"
+        ledger_ts = "2026-07-27T12:27:19.500000+00:00"
+        latency_ms = 2500
+        qwen_entries = [{"ts": ledger_ts, "latency_ms": latency_ms}]
+
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        write_capture(tmp_path, cap_name, msgs_a)
+        write_capture(tmp_path, "req-20260727T122718.000000-0004.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, qwen_entries)
+
+        assert len(usable) == 0
+        captured = capsys.readouterr()
+        assert "Qwen3-14B" in captured.err
+
+    def test_qwen_no_match_without_latency_correction(self, tmp_path, capsys):
+        # Same ledger completion ts as above, but latency_ms omitted (None).
+        # The completion ts (12:27:19.500) is ~2.5s after the capture arrival
+        # (12:27:17.000), which exceeds the ±2s window — so no skip fires.
+        cap_name = "req-20260727T122717.000000-0003.json"
+        ledger_ts = "2026-07-27T12:27:19.500000+00:00"
+        qwen_entries = [{"ts": ledger_ts, "latency_ms": None}]
+
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        write_capture(tmp_path, cap_name, msgs_a)
+        write_capture(tmp_path, "req-20260727T122718.000000-0004.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, qwen_entries)
+
+        assert len(usable) == 1  # NOT skipped — no Qwen match
 
     def test_skip_over_limit(self, tmp_path, capsys):
         # Need est_tokens > 60000. estimate_prompt_tokens counts chars // 4
@@ -302,6 +349,103 @@ class TestSkipRules:
         assert len(usable) == 0
         captured = capsys.readouterr()
         assert "no appended messages" in captured.err
+
+    def test_singleton_chain_drop_logged(self, tmp_path, capsys):
+        # A single-capture chain (length 1) must be logged, not silently
+        # dropped. Divergent first messages produce two length-1 chains.
+        msgs_a = [sys_msg(), user_msg("question A")]
+        msgs_b = [sys_msg(), user_msg("question B")]
+        write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
+        write_capture(tmp_path, "req-20260101T000001.000000-0001.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        emr.process_pairs(chains, [])
+
+        captured = capsys.readouterr()
+        assert "no pairs possible" in captured.err
+        assert "chain-01" in captured.err
+
+    def test_malformed_args_skips_pair(self, tmp_path, capsys):
+        # A tool_call whose arguments are not valid JSON must skip the pair
+        # with a logged reason, not silently substitute empty args.
+        bad_assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function",
+                 "function": {"name": "read",
+                              "arguments": "{not valid json"}},
+            ],
+        }
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), bad_assistant]
+        write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
+        write_capture(tmp_path, "req-20260101T000001.000000-0001.json", msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        chains = emr.group_chains(rows)
+        usable = emr.process_pairs(chains, [])
+
+        assert len(usable) == 0
+        captured = capsys.readouterr()
+        assert "malformed tool_call arguments" in captured.err
+        assert "JSONDecodeError" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 2b. Class-filter before chain grouping
+# ---------------------------------------------------------------------------
+
+class TestClassFilterBeforeGrouping:
+    def test_non_main_filtered_before_grouping(self, tmp_path, capsys):
+        # Interleaved non-main capture between two main captures would
+        # fragment the chain if not filtered first. With class-filtering
+        # applied before group_chains, the two main captures form one chain.
+        main_msgs_a = [sys_msg(), user_msg()]
+        main_msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        nonmain_msgs = [{"role": "system", "content": NONMAIN_SYS},
+                        user_msg()]
+
+        write_capture(tmp_path, "req-20260101T000000.000000-0000.json",
+                      main_msgs_a)
+        write_capture(tmp_path, "req-20260101T000001.000000-0001.json",
+                      nonmain_msgs, tools=[])
+        write_capture(tmp_path, "req-20260101T000002.000000-0002.json",
+                      main_msgs_b)
+
+        rows = emr.load_captures(tmp_path)
+        # Mirror the class-filter logic from main().
+        main_rows = [r for r in rows
+                     if emr.classify(r["body"]).cls == "main"]
+        chains = emr.group_chains(main_rows)
+
+        assert len(chains) == 1
+        assert len(chains[0]) == 2
+
+    def test_build_reference_returns_none_on_malformed_json(self):
+        bad_assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function",
+                 "function": {"name": "read",
+                              "arguments": "{not valid json"}},
+            ],
+        }
+        assert emr.build_reference(bad_assistant) is None
+
+    def test_build_reference_returns_none_on_non_string_non_dict_args(self):
+        weird_assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function",
+                 "function": {"name": "read",
+                              "arguments": 12345}},
+            ],
+        }
+        assert emr.build_reference(weird_assistant) is None
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +557,9 @@ class TestSampling:
 # ---------------------------------------------------------------------------
 
 class TestCaseFormat:
+    def test_reference_model_constant(self):
+        assert emr.REFERENCE_MODEL == "z-ai/glm-5.2"
+
     def test_output_jsonl_fields(self, tmp_path):
         msgs_a = [sys_msg(), user_msg()]
         msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
