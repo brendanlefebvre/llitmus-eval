@@ -865,21 +865,44 @@ def build_constraint_prompt(tokenizer, case: "ConstraintCase",
                  enable_thinking=enable_thinking)
 
 
+def _stringify_content(messages: list) -> list:
+    """Join list-of-parts message content into plain strings.
+
+    Real captures carry OpenAI-style content arrays
+    (``[{"type": "text", "text": ...}, ...]``); chat templates assume
+    strings and crash on lists (Qwen3: ``'list object' has no attribute
+    'startswith'``). Every serving layer joins text parts before
+    templating, so this is render-faithfulness, not body mutation — the
+    capture on disk is untouched.
+    """
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            m = dict(m)
+            m["content"] = "\n".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text")
+        out.append(m)
+    return out
+
+
 def build_replay_prompt(tokenizer, case: "ReplayCase", native: bool,
                         enable_thinking=None) -> str:
     """Build the prompt from the captured request body.
 
     The prompt IS the captured request: its messages array (which already
     contains the session's system prompt) is applied to the chat template
-    directly. For native mode the captured `tools` array is forwarded
-    byte-verbatim. For prompted mode the ``_PROMPTED_SYSTEM`` convention
-    plus the request's own tool schemas are appended as a final system
-    message — the sole deliberate deviation from body-verbatim — so the
-    model sees the JSON shape it is graded on (spec, 2026-07-28).
+    directly (content-part lists joined to strings — see
+    _stringify_content). For native mode the captured `tools` array is
+    forwarded byte-verbatim. For prompted mode the ``_PROMPTED_SYSTEM``
+    convention plus the request's own tool schemas are appended as a final
+    system message — the sole deliberate deviation from body-verbatim — so
+    the model sees the JSON shape it is graded on (spec, 2026-07-28).
     """
     with open(case.capture_path, encoding="utf-8") as f:
         body = json.load(f)
-    messages = body["messages"]
+    messages = _stringify_content(body["messages"])
     if native:
         tools = body.get("tools")
         return _chat(tokenizer, messages, tools=tools,

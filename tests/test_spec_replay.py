@@ -743,6 +743,32 @@ class TestBuildReplayPrompt:
         assert convention_head not in prompt
         assert tok.last_messages == msgs
 
+    def test_content_part_lists_joined_for_template(self, tmp_path):
+        """OpenAI-style content arrays are joined to strings at render time.
+
+        Real captures carry list-of-parts content; chat templates assume
+        strings (Qwen3 crashed on every real case before this). The join is
+        what every serving layer does before templating — the capture file
+        itself is untouched.
+        """
+        msgs = [{"role": "system", "content": "sys"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"},
+                    {"type": "image_url", "image_url": {"url": "x"}}]},
+                {"role": "user", "content": "plain string"}]
+        cap = _make_capture(tmp_path, "req-1.json", messages=msgs,
+                            tools=[READ_TOOL])
+        case = _replay_case(cap)
+        tok = ReplayFakeTokenizer()
+        build_replay_prompt(tok, case, native=True)
+        rendered = tok.last_messages
+        assert rendered[1]["content"] == "part one\npart two"
+        assert rendered[2]["content"] == "plain string"
+        # original file untouched
+        body = json.loads(open(cap).read())
+        assert isinstance(body["messages"][1]["content"], list)
+
     def test_prompted_does_not_mutate_captured_messages(self, tmp_path):
         """After build_replay_prompt, the capture file's messages are unchanged."""
         msgs = [{"role": "system", "content": "sys"},
