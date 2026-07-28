@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -132,6 +133,16 @@ class ToolCase:
     prompt: str
     tools: list   # list[dict] JSON-Schema
     expect: dict  # {"tool": str|None, "arguments": dict}
+
+
+@dataclass
+class ReplayCase:
+    id: str
+    capture_path: str
+    chain_id: str
+    depth_stratum: str          # "shallow" | "mid" | "deep"
+    est_tokens: int
+    reference: dict             # {acted: bool, tools: list[str], arguments: list[dict]}
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +281,43 @@ def _load_tool_line(obj: dict, ln: int) -> "ToolCase":
     return ToolCase(id=cid, prompt=prompt, tools=tools, expect=expect)
 
 
+_REPLAY_STRATA = ("shallow", "mid", "deep")
+
+
+def _load_replay_line(obj: dict, ln: int) -> "ReplayCase":
+    cid = _require(obj, "id", ln)
+    if not isinstance(cid, str):
+        raise CaseError(f"line {ln}: 'id' must be a string")
+    capture_path = _require(obj, "capture_path", ln)
+    if not isinstance(capture_path, str):
+        raise CaseError(f"line {ln}: 'capture_path' must be a string")
+    if not os.path.exists(capture_path):
+        raise CaseError(f"line {ln}: 'capture_path' does not exist: {capture_path}")
+    chain_id = _require(obj, "chain_id", ln)
+    if not isinstance(chain_id, str):
+        raise CaseError(f"line {ln}: 'chain_id' must be a string")
+    depth_stratum = _require(obj, "depth_stratum", ln)
+    if depth_stratum not in _REPLAY_STRATA:
+        raise CaseError(
+            f"line {ln}: 'depth_stratum' must be one of "
+            f"{', '.join(_REPLAY_STRATA)}, got {depth_stratum!r}")
+    est_tokens = _require(obj, "est_tokens", ln)
+    if not isinstance(est_tokens, int) or isinstance(est_tokens, bool):
+        raise CaseError(f"line {ln}: 'est_tokens' must be an integer")
+    reference = _require(obj, "reference", ln)
+    if not isinstance(reference, dict):
+        raise CaseError(f"line {ln}: 'reference' must be an object")
+    if "acted" not in reference or not isinstance(reference["acted"], bool):
+        raise CaseError(f"line {ln}: reference.acted must be a boolean")
+    if not isinstance(reference.get("tools"), list):
+        raise CaseError(f"line {ln}: reference.tools must be a list")
+    if not isinstance(reference.get("arguments"), list):
+        raise CaseError(f"line {ln}: reference.arguments must be a list")
+    return ReplayCase(id=cid, capture_path=capture_path, chain_id=chain_id,
+                      depth_stratum=depth_stratum, est_tokens=est_tokens,
+                      reference=reference)
+
+
 def load_cases(path: str, profile: str) -> list:
     # chore: reuses the constraints loader/runner. Checks are compliance-only
     # (length, format, forbidden prefixes). The profile discriminates: 14B
@@ -280,7 +328,8 @@ def load_cases(path: str, profile: str) -> list:
     # and was wrong.
     loader = {"constraints": _load_constraint_line,
               "chore": _load_constraint_line,
-              "tool-calling": _load_tool_line}.get(profile)
+              "tool-calling": _load_tool_line,
+              "main-replay": _load_replay_line}.get(profile)
     if loader is None:
         raise CaseError(f"unknown profile '{profile}'")
     cases = []
@@ -444,6 +493,179 @@ def aggregate_tool(per_case: list) -> dict:
     return {d: _rate([c[d] for c in per_case]) for d in dims}
 
 
+# ---------------------------------------------------------------------------
+# main-replay tier-0 scoring
+# ---------------------------------------------------------------------------
+
+# JSON schema "type" -> python type. Note: python's bool is a subclass of int,
+# so integer/number checks must explicitly reject bools (see _check_args_schema).
+_JSON_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def _capture_tool_names(capture_tools: list) -> set:
+    names = set()
+    for t in capture_tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", {})
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def _capture_tool_params(capture_tools: list, tool_name: str) -> Optional[dict]:
+    """Return the JSON-schema `parameters` object for `tool_name`, or None."""
+    for t in capture_tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", {})
+        if isinstance(fn, dict) and fn.get("name") == tool_name:
+            params = fn.get("parameters", {})
+            return params if isinstance(params, dict) else {}
+    return None
+
+
+def _check_args_schema(args, properties, required) -> bool:
+    """Schema validation: required keys present, no hallucinated keys, types match.
+
+    Deliberately NOT exact-value equality (unlike score_tool_call): at a real
+    mid-session decision point there is no single correct argument value, but
+    there is exactly one schema.
+    """
+    if not isinstance(args, dict):
+        return False
+    for r in (required or []):
+        if r not in args:
+            return False
+    props = properties or {}
+    # no hallucinated keys
+    for k in args:
+        if k not in props:
+            return False
+    # types match
+    for k, v in args.items():
+        schema = props.get(k, {})
+        if not isinstance(schema, dict):
+            continue
+        t = schema.get("type")
+        if t is None:
+            continue
+        types = t if isinstance(t, list) else [t]
+        matched = False
+        for ti in types:
+            expected = _JSON_TYPE_MAP.get(ti)
+            if expected is None:
+                # unknown type name — don't fail on what we can't check
+                matched = True
+                break
+            # bool is a subclass of int in python; JSON integer/number must
+            # reject a bool value.
+            if ti in ("integer", "number") and isinstance(v, bool):
+                continue
+            if isinstance(v, expected):
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def score_replay_call(parsed: "ParsedCall", case: "ReplayCase",
+                      capture_tools: list, closed: bool = True) -> dict:
+    """Tier-0 mechanical validity for a main-replay case.
+
+    Returns:
+        acted_ok, well_formed, tool_exists (bool), args_schema_ok (bool|None),
+        action_valid (bool).
+    """
+    if not closed:
+        # thinking budget exhausted — no answer to score. All-false, matching
+        # the existing profiles' treatment of an unclosed thinking tag.
+        return {"acted_ok": False, "well_formed": False, "tool_exists": False,
+                "args_schema_ok": False, "action_valid": False}
+
+    ref = case.reference
+    ref_acted = bool(ref.get("acted"))
+    candidate_acted = parsed.tool is not None
+
+    acted_ok = (ref_acted == candidate_acted)
+    well_formed = parsed.well_formed
+
+    if not candidate_acted:
+        # No tool call: tool_exists is vacuously satisfied; args_schema is not
+        # checkable. action_valid turns on acted_ok + well_formed only.
+        return {"acted_ok": acted_ok, "well_formed": well_formed,
+                "tool_exists": True, "args_schema_ok": None,
+                "action_valid": acted_ok and well_formed}
+
+    tool_names = _capture_tool_names(capture_tools)
+    tool_exists = parsed.tool in tool_names
+
+    args_schema_ok: Optional[bool]
+    if not tool_exists:
+        # tool not in the capture's tools — can't validate its schema.
+        args_schema_ok = None
+    else:
+        params = _capture_tool_params(capture_tools, parsed.tool)
+        if params is None:
+            args_schema_ok = None
+        else:
+            args_schema_ok = _check_args_schema(
+                parsed.arguments or {}, params.get("properties"),
+                params.get("required"))
+
+    action_valid = acted_ok and well_formed and tool_exists
+    if args_schema_ok is not None:
+        action_valid = action_valid and args_schema_ok
+    return {"acted_ok": acted_ok, "well_formed": well_formed,
+            "tool_exists": tool_exists, "args_schema_ok": args_schema_ok,
+            "action_valid": action_valid}
+
+
+_DEPTH_WEIGHTS = {"shallow": 0.075, "mid": 0.383, "deep": 0.542}
+
+
+def aggregate_replay(per_case: list) -> dict:
+    """Aggregate main-replay tier-0 results.
+
+    `per_case` is a list of score dicts (from score_replay_call), each
+    optionally carrying a `depth_stratum` key for per-stratum breakdown.
+    """
+    n_cases = len(per_case)
+    dims = ["acted_ok", "well_formed", "tool_exists", "args_schema_ok"]
+    by_dimension = {d: _rate([c.get(d) for c in per_case]) for d in dims}
+    action_valid = (sum(1 for c in per_case if c.get("action_valid")) / n_cases
+                    if n_cases else 0.0)
+
+    by_depth: dict = {}
+    for stratum in _REPLAY_STRATA:
+        rows = [c for c in per_case if c.get("depth_stratum") == stratum]
+        n = len(rows)
+        if n:
+            rate = sum(1 for c in rows if c.get("action_valid")) / n
+        else:
+            rate = 0.0
+        by_depth[stratum] = {"action_valid": rate, "n": n}
+
+    return {
+        "action_valid": action_valid,
+        "by_dimension": by_dimension,
+        "by_depth": by_depth,
+        "depth_weights": dict(_DEPTH_WEIGHTS),
+        "n_cases": n_cases,
+    }
+
+
 def strip_thinking(text: str) -> tuple[str, bool]:
     """Split a reasoning preamble off the front of `text`.
 
@@ -538,6 +760,25 @@ def build_constraint_prompt(tokenizer, case: "ConstraintCase",
                  enable_thinking=enable_thinking)
 
 
+def build_replay_prompt(tokenizer, case: "ReplayCase", native: bool,
+                        enable_thinking=None) -> str:
+    """Build the prompt from the captured request body, verbatim by reference.
+
+    The prompt IS the captured request: its messages array (which already
+    contains the session's system prompt) is applied to the chat template
+    directly. For native mode the captured `tools` array is forwarded; for
+    prompted mode no tools are passed (the model relies on the system prompt
+    already in the messages to learn the tool format). No synthetic system
+    prompt is injected — the case is the request.
+    """
+    with open(case.capture_path, encoding="utf-8") as f:
+        body = json.load(f)
+    messages = body["messages"]
+    tools = body.get("tools") if native else None
+    return _chat(tokenizer, messages, tools=tools,
+                 enable_thinking=enable_thinking)
+
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
@@ -624,6 +865,49 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool,
     }
 
 
+def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
+                    enable_thinking=None) -> dict:
+    """Replay captured LLM request bodies through a local model and score tier-0.
+
+    The prompt is the captured request body verbatim by reference: the runner
+    reads the capture file for `messages`, `tools`, and `max_tokens`, applies
+    the chat template, and generates with the captured `max_tokens` (32000) —
+    NOT a tight action budget. This is a deliberate parameter decision per the
+    spec: the candidate gets the same token room the serving model had.
+
+    Unlike run_tool_calling, each case runs in a single convention (native if
+    the model supports tools, prompted otherwise) — there is no paired column.
+    """
+    per_case_scores, records, errored = [], [], []
+    for case in cases:
+        try:
+            with open(case.capture_path, encoding="utf-8") as f:
+                body = json.load(f)
+            max_tokens = int(body.get("max_tokens", 32000))
+            capture_tools = body.get("tools") or []
+            prompt = build_replay_prompt(tokenizer, case, native,
+                                         enable_thinking=enable_thinking)
+            raw = generate_fn(prompt, max_tokens=max_tokens)
+        except Exception as e:  # noqa: BLE001 - report, don't crash the run
+            errored.append({"id": case.id, "error": str(e)})
+            continue
+        text, closed = strip_thinking(raw)
+        parsed = parse_native(text) if native else parse_prompted(text)
+        score = score_replay_call(parsed, case, capture_tools, closed=closed)
+        # Attach depth_stratum so aggregate_replay can break down by stratum.
+        score_with_depth = dict(score)
+        score_with_depth["depth_stratum"] = case.depth_stratum
+        per_case_scores.append(score_with_depth)
+        records.append({
+            "id": case.id, "chain_id": case.chain_id,
+            "depth_stratum": case.depth_stratum, "native": native,
+            "score": score, "output_sample": text[:200],
+            "thinking_unclosed": not closed,
+        })
+    return {"aggregate": aggregate_replay(per_case_scores),
+            "cases": records, "errored": errored}
+
+
 # ---------------------------------------------------------------------------
 # output
 # ---------------------------------------------------------------------------
@@ -663,11 +947,34 @@ def format_constraint_table(label: str, result: dict) -> str:
     return "\n".join(lines)
 
 
+def format_replay_table(label: str, result: dict) -> str:
+    agg = result["aggregate"]
+    lines = [f"{label}:  action_valid={agg['action_valid']:.2f}  "
+             f"(n={agg['n_cases']})"]
+    dims = agg.get("by_dimension") or {}
+    if dims:
+        lines.append("  by dimension: " + "  ".join(
+            f"{k}={_fmt(v)}" for k, v in dims.items()))
+    by_depth = agg.get("by_depth") or {}
+    if by_depth:
+        parts = []
+        for s in ("shallow", "mid", "deep"):
+            d = by_depth.get(s) or {}
+            parts.append(f"{s}={_fmt(d.get('action_valid'))}"
+                         f"(n={d.get('n', 0)})")
+        lines.append("  by depth: " + "  ".join(parts))
+    if result["errored"]:
+        lines.append(f"  errored: {len(result['errored'])} case(s)")
+    return "\n".join(lines)
+
+
 def _headline(result: dict, profile: str) -> float:
     """The one number a thinking/no-thinking comparison turns on."""
     agg = result["aggregate"]
     if profile in ("constraints", "chore"):
         return agg["strict"] or 0.0
+    if profile == "main-replay":
+        return agg.get("action_valid") or 0.0
     return (agg["prompted"] or {}).get("right_tool") or 0.0
 
 
@@ -681,7 +988,9 @@ def format_thinking_gap(label: str, per_mode: dict, profile: str,
     """
     off, on = per_mode["no-think"], per_mode["think"]
     gap = _headline(on, profile) - _headline(off, profile)
-    metric = "strict" if profile in ("constraints", "chore") else "right_tool"
+    metric = ("strict" if profile in ("constraints", "chore")
+              else "action_valid" if profile == "main-replay"
+              else "right_tool")
     t_off = tokens_per_case.get("no-think") or 0.0
     t_on = tokens_per_case.get("think") or 0.0
     cost = f"{t_off:.0f} -> {t_on:.0f} tok/case"
@@ -735,15 +1044,17 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
 # ---------------------------------------------------------------------------
 
 import argparse
-import os
 import statistics
 
 DEFAULT_CASES = {
     "tool-calling": "cases/tool_calling.jsonl",
     "constraints": "cases/constraints.jsonl",
     "chore": "cases/chore.jsonl",
+    "main-replay": "cases/main_replay.jsonl",
 }
 DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512, "chore": 64}
+# main-replay is deliberately absent: max_tokens comes from the captured body
+# (32000), NOT from the CLI. The runner reads body["max_tokens"] per case.
 
 # Reasoning models need room for the scratchpad on top of the answer. Measured
 # on Ternary-Bonsai-27B-mlx-2bit (2026-07-15): the <think> preamble alone runs
@@ -762,7 +1073,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", required=True,
-                    choices=["tool-calling", "constraints", "chore"])
+                    choices=["tool-calling", "constraints", "chore",
+                             "main-replay"])
     ap.add_argument("--cases", default=None, help="JSONL case file (default per profile)")
     ap.add_argument("--sizes", default="1.7B,4B,8B")
     ap.add_argument("--repo", default=None)
@@ -777,9 +1089,16 @@ def main() -> None:
     args = ap.parse_args()
 
     cases_path = args.cases or DEFAULT_CASES[args.profile]
-    max_tokens = args.max_tokens or DEFAULT_MAX_TOKENS[args.profile]
-    think_max_tokens = (args.think_max_tokens
-                        or THINKING_MAX_TOKENS[args.profile])
+    if args.profile == "main-replay":
+        # max_tokens comes from the captured body (32000), not the CLI. The
+        # budgets below are only display placeholders; the per-case budget is
+        # read by run_main_replay from each capture file.
+        max_tokens = None
+        think_max_tokens = None
+    else:
+        max_tokens = args.max_tokens or DEFAULT_MAX_TOKENS[args.profile]
+        think_max_tokens = (args.think_max_tokens
+                            or THINKING_MAX_TOKENS[args.profile])
     cases = load_cases(cases_path, args.profile)   # fail-fast before loading a model
     print(f"loaded {len(cases)} cases from {cases_path}")
 
@@ -791,7 +1110,7 @@ def main() -> None:
         print(f"loaded in {t_load:.1f}s")
 
         thinking = supports_thinking(tokenizer)
-        native = (args.profile == "tool-calling"
+        native = (args.profile in ("tool-calling", "main-replay")
                   and supports_native_tools(tokenizer))
         conv = {"prompted": True, "native": native, "thinking": thinking}
 
@@ -811,22 +1130,42 @@ def main() -> None:
         for mode, flag, budget in modes:
             tally = {"tokens": 0, "calls": 0, "latencies": [], "gen_seconds": 0.0}
 
-            def gen(p, _budget=budget, _tally=tally,
-                    _model=model, _tok=tokenizer):
-                t0 = time.perf_counter()
-                text = "".join(backend.stream(_model, _tok, p, _budget))
-                elapsed = time.perf_counter() - t0
-                _tally["latencies"].append(elapsed * 1000)
-                _tally["gen_seconds"] += elapsed
-                _tally["tokens"] += len(_tok.encode(text))
-                _tally["calls"] += 1
-                return text
+            if args.profile == "main-replay":
+                # main-replay's budget comes from each capture's body
+                # (max_tokens=32000), not the CLI mode budget. The gen closure
+                # accepts max_tokens as a kwarg from run_main_replay.
+                def gen(p, max_tokens=32000, _tally=tally,
+                        _model=model, _tok=tokenizer):
+                    t0 = time.perf_counter()
+                    text = "".join(backend.stream(_model, _tok, p, max_tokens))
+                    elapsed = time.perf_counter() - t0
+                    _tally["latencies"].append(elapsed * 1000)
+                    _tally["gen_seconds"] += elapsed
+                    _tally["tokens"] += len(_tok.encode(text))
+                    _tally["calls"] += 1
+                    return text
+            else:
+                def gen(p, _budget=budget, _tally=tally,
+                        _model=model, _tok=tokenizer):
+                    t0 = time.perf_counter()
+                    text = "".join(backend.stream(_model, _tok, p, _budget))
+                    elapsed = time.perf_counter() - t0
+                    _tally["latencies"].append(elapsed * 1000)
+                    _tally["gen_seconds"] += elapsed
+                    _tally["tokens"] += len(_tok.encode(text))
+                    _tally["calls"] += 1
+                    return text
 
-            print(f"\n--- {label} [{mode}] (max_tokens={budget}) ---")
+            budget_display = "capture (per-case)" if args.profile == "main-replay" else budget
+            print(f"\n--- {label} [{mode}] (max_tokens={budget_display}) ---")
             if args.profile in ("constraints", "chore"):
                 result = run_constraints(cases, tokenizer, gen,
                                          enable_thinking=flag)
                 print(format_constraint_table(f"{label} [{mode}]", result))
+            elif args.profile == "main-replay":
+                result = run_main_replay(cases, tokenizer, gen, native=native,
+                                         enable_thinking=flag)
+                print(format_replay_table(f"{label} [{mode}]", result))
             else:
                 result = run_tool_calling(cases, tokenizer, gen, native=native,
                                           enable_thinking=flag)
