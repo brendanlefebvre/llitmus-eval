@@ -125,10 +125,7 @@ def _reference_parsed_call(n1_body: dict, n_count: int) -> ParsedCall:
         name = fn.get("name")
         args_raw = fn.get("arguments", "{}")
         if isinstance(args_raw, str):
-            try:
-                args = json.loads(args_raw)
-            except json.JSONDecodeError:
-                args = {}
+            args = json.loads(args_raw)
         elif isinstance(args_raw, dict):
             args = args_raw
         else:
