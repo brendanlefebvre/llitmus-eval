@@ -248,6 +248,18 @@ visible, never implicit. Chain ids are derived from the first capture's
 timestamp stem, not enumeration order, so `by_chain` is comparable across
 extractions.
 
+**Outcome categories (2026-07-28, from the first live run):** results are
+reported as three categories, never two plus a hole: *rendered-and-valid*,
+*rendered-and-invalid*, and *could-not-render*. Could-not-render — e.g.
+Llama-3.2's template refusing any conversation history containing parallel
+tool calls, 10 of 15 cases — is an adequacy failure of a **distinct kind**:
+in production, a template that cannot render the prompt means routing there
+fails outright, which is the routing-relevant outcome. It gets its own
+category rather than a footnote because the remedy differs (a harness might
+fix a template; it cannot fix the model), and because "0.00 on 5 of 15"
+invites the question of what happened to the other ten — the honest answer
+is worse for the model than silence implies.
+
 The eventual `adequacy_scores.json` entry for `class=main` is `{model,
 reference_model, action_valid_weighted, tool_agreement, by_depth}` plus the
 cost axes — two-axis adequacy, exactly as the chore work concluded (a model
@@ -320,7 +332,14 @@ or failure-to-act at all.
   15k+-token contexts — then tier 0 has no discriminating power for `main` and
   the gate is falsified. Expected result: the 1B collapses; if it does not,
   this design is wrong and the honest conclusion is that mechanical validity
-  does not separate models on this class.
+  does not separate models on this class. **Comparison rule (2026-07-28):**
+  state F2 as shallow-vs-shallow between models plus the larger model's own
+  depth curve — never headline-vs-headline when `depth_weight_coverage`
+  differs (a 0.13-coverage number against a 1.0-coverage number is not a
+  comparison; say so rather than letting them sit side by side). Report cost
+  alongside any rejection: a model rejected on measured merit (the 1B:
+  5.7 s/case, 2.5 GB peak — genuinely cheap, genuinely inadequate) is the
+  instrument working, not an assumption confirmed.
 - **F3a — no truncation (hard gate, checked directly).** For every case,
   compare the tokenizer's count of the prompt actually fed to the model against
   the case's expected length. Any mismatch is a harness bug (truncation,
@@ -453,6 +472,19 @@ sidecar, not silently.
   scores as agreement all the same.
 - **Edit and code quality.** `args_schema_ok` does not mean the edit compiles,
   the bash command is safe, or the code is right. Nothing executes.
+- **Fabricated completion is detected only when the reference acted.** Live
+  worked example (mr-005, 2026-07-28): Llama-3.2-1B emitted a fake
+  `{"status": "success", ...}` object claiming the work was already done —
+  parroting a commit message from its own context — and was caught solely
+  because the reference acted, so `acted_ok` failed on the mismatch. Had the
+  correct next move been prose, the same fabricated success would have
+  scored `acted_ok=True` and passed tier 0. Tier 1 does not close this
+  either: a fake success and a genuine prose answer are both *respond*-class,
+  so `action_class_match` passes. This is the over-acting blind spot
+  inverted, and the more dangerous half — a malformed call fails loudly; a
+  fabricated success is a lie the agentic loop acts on. Only content-level
+  judgment (tier 2, or production signals) can catch it on prose-reference
+  turns.
 - **Prose-turn quality.** When the right move is to answer the user in text,
   only the act-vs-respond decision is scored, not the answer.
 - **Goal achievement.** Whether the session accomplished what the user wanted
