@@ -16,6 +16,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "scripts"))
 import extract_main_replay as emr  # noqa: E402
 
 
+def _pp(chains, qwen_entries, count_tokens=None, limit=131072, stats=None):
+    """process_pairs with a neutral counting fn: every body 'counts' as 100
+    tokens (shallow) unless a test injects its own count_tokens/limit."""
+    return emr.process_pairs(chains, qwen_entries,
+                             count_tokens or (lambda body: 100),
+                             limit, stats=stats)
+
+
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
@@ -197,7 +205,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -214,7 +222,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -228,7 +236,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -243,7 +251,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -266,7 +274,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, qwen_entries)
+        usable = _pp(chains, qwen_entries)
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -291,7 +299,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, qwen_entries)
+        usable = _pp(chains, qwen_entries)
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -313,7 +321,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, qwen_entries)
+        usable = _pp(chains, qwen_entries)
 
         assert len(usable) == 0  # conservatively skipped
         captured = capsys.readouterr()
@@ -337,29 +345,22 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, qwen_entries)
+        usable = _pp(chains, qwen_entries)
 
         assert len(usable) == 1  # NOT skipped — outside even ±600s
 
     def test_skip_over_limit(self, tmp_path, capsys):
-        # Need ref_tokens > 60000. estimate_prompt_tokens counts chars // 4
-        # for content + tool schema JSON chars // 4.
-        # A 240001-char user message → 60000 tokens (content alone).
-        # Need >60000, so 240005 chars → 60001 tokens.
-        big_content = "x" * 240005
-        msgs_a = [sys_msg(), user_msg(big_content)]
-        msgs_b = [sys_msg(), user_msg(big_content),
-                  assistant_tool_msg(), tool_msg()]
+        msgs_a = [sys_msg(), user_msg("hi")]
+        msgs_b = [sys_msg(), user_msg("hi"), assistant_tool_msg(), tool_msg()]
         write_capture(tmp_path, "req-20260101T000000.000000-0000.json", msgs_a)
         write_capture(tmp_path, "req-20260101T000001.000000-0001.json", msgs_b)
-
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
-
-        assert len(usable) == 0
-        captured = capsys.readouterr()
-        assert "over limit" in captured.err
+        stats = {}
+        usable = _pp(chains, [], count_tokens=lambda body: 131073,
+                     limit=131072, stats=stats)
+        assert usable == []
+        assert stats["over_limit"] == 1
 
     def test_usable_pair_passes_all_rules(self, tmp_path, capsys):
         msgs_a = [sys_msg(), user_msg()]
@@ -369,7 +370,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 1
         pair = usable[0]
@@ -386,7 +387,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -402,7 +403,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        emr.process_pairs(chains, [])
+        _pp(chains, [])
 
         captured = capsys.readouterr()
         assert "no pairs possible" in captured.err
@@ -427,7 +428,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -455,7 +456,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 0
         captured = capsys.readouterr()
@@ -480,7 +481,7 @@ class TestSkipRules:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 1
         assert usable[0]["reference"]["arguments"] == [{}]
@@ -577,20 +578,41 @@ class TestClassFilterBeforeGrouping:
 
 class TestStratumAssignment:
     def test_shallow_boundary(self):
-        assert emr.assign_stratum(0) == "shallow"
-        assert emr.assign_stratum(15999) == "shallow"
+        assert emr.assign_stratum(0, 60000) == "shallow"
+        assert emr.assign_stratum(15999, 60000) == "shallow"
 
     def test_mid_boundary(self):
-        assert emr.assign_stratum(16000) == "mid"
-        assert emr.assign_stratum(39999) == "mid"
+        assert emr.assign_stratum(16000, 60000) == "mid"
+        assert emr.assign_stratum(39999, 60000) == "mid"
 
     def test_deep_boundary(self):
-        assert emr.assign_stratum(40000) == "deep"
-        assert emr.assign_stratum(60000) == "deep"
+        assert emr.assign_stratum(40000, 60000) == "deep"
+        assert emr.assign_stratum(60000, 60000) == "deep"
 
     def test_over_limit_excluded(self):
-        assert emr.assign_stratum(60001) is None
-        assert emr.assign_stratum(100000) is None
+        assert emr.assign_stratum(60001, 60000) is None
+        assert emr.assign_stratum(100000, 60000) is None
+
+
+# ---------------------------------------------------------------------------
+# 3b. Fleet max context gate
+# ---------------------------------------------------------------------------
+
+class TestFleetMaxContext:
+    def test_max_over_resolvable_fleet(self, monkeypatch):
+        monkeypatch.setattr(emr, "resolve_context_length",
+                            lambda repo: {"a": 40960, "b": 131072}.get(repo))
+        assert emr.fleet_max_context(("a", "b")) == 131072
+
+    def test_unresolvable_repo_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(emr, "resolve_context_length",
+                            lambda repo: 40960 if repo == "a" else None)
+        assert emr.fleet_max_context(("a", "b")) == 40960
+
+    def test_nothing_resolvable_exits(self, monkeypatch):
+        monkeypatch.setattr(emr, "resolve_context_length", lambda repo: None)
+        with pytest.raises(SystemExit):
+            emr.fleet_max_context(("a", "b"))
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +713,7 @@ class TestCaseFormat:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
         sample, _ = emr.sample_cases(usable, 5)
 
         case = {
@@ -720,7 +742,7 @@ class TestCaseFormat:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 1
         ref = usable[0]["reference"]
@@ -748,7 +770,7 @@ class TestCaseFormat:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
 
         assert len(usable) == 1
         ref = usable[0]["reference"]
@@ -766,7 +788,7 @@ class TestCaseFormat:
         out_path = tmp_path / "out.jsonl"
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
         sample, _ = emr.sample_cases(usable, 5)
 
         lines = []
@@ -808,7 +830,7 @@ class TestLedgerAudit:
         # Empty qwen_entries: the skip rule missed the row (e.g. a
         # served_model spelling load_qwen_timestamps does not recognize),
         # so the pair lands in the sample — the audit's failure mode.
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
         sample, _ = emr.sample_cases(usable, 5)
         return rows, set(c["capture_path"] for c in sample)
 
@@ -846,7 +868,7 @@ class TestLedgerAudit:
                       msgs_b)
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
         sample, _ = emr.sample_cases(usable, 5)
         sampled_paths = set(c["capture_path"] for c in sample)
         assert sampled_paths
@@ -931,13 +953,15 @@ class TestCorpusMeta:
 
         rows = emr.load_captures(tmp_path)
         chains = emr.group_chains(rows)
-        usable = emr.process_pairs(chains, [])
+        usable = _pp(chains, [])
         sample, coverage = emr.sample_cases(usable, 5)
 
         output_path = tmp_path / "cases" / "main_replay.jsonl"
         pop = {"shallow": 1, "mid": 0, "deep": 0}
         meta_path = emr.write_meta(
-            output_path, len(rows), rows[-1]["name"], sample, coverage, pop)
+            output_path, len(rows), rows[-1]["name"], sample, coverage, pop,
+            tokenizer_repo="mlx-community/Qwen3-14B-4bit",
+            fleet_max=131072, over_limit=0)
 
         assert meta_path == tmp_path / "cases" / "main_replay.meta.json"
         assert meta_path.exists()
@@ -951,6 +975,9 @@ class TestCorpusMeta:
         assert meta["depth_weights"] == {"shallow": 1.0, "mid": 0.0,
                                          "deep": 0.0}
         assert meta["chains_represented"] == ["chain-20260101T000000"]
+        assert meta["tokenizer"] == "mlx-community/Qwen3-14B-4bit"
+        assert meta["fleet_max_context"] == 131072
+        assert meta["over_limit"] == 0
 
     def test_depth_weights_from_population(self):
         w = emr.depth_weights_from_population(

@@ -26,9 +26,11 @@ from datetime import datetime, timedelta
 
 from loxo_llm_router import (
     classify,
-    estimate_prompt_tokens,
-    LOCAL_CONTEXT_LIMIT,
 )
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from litmus_common import resolve_context_length  # noqa: E402
+from litmus_spec import count_ref_tokens          # noqa: E402
 
 CURL_PROBES = frozenset({
     "req-20260727T121220.315928-0000.json",
@@ -45,6 +47,32 @@ ADEQUACY_LEDGER = pathlib.Path(
 # hardcoded in litmus_spec) so the runner/sidecar can read it from the case
 # file. Matches the increment-1 reference per the adequacy design spec.
 REFERENCE_MODEL = "z-ai/glm-5.2"
+
+# Reference tokenizer used for exact ref_tokens counts. Must be present in
+# the local HF cache before extraction runs.
+REF_TOKENIZER = "mlx-community/Qwen3-14B-4bit"
+
+# Candidate models the corpus must be in-scope for; the corpus gate is the
+# max of their native contexts (spec 2026-07-29, "fleet max").
+FLEET = (
+    "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "mlx-community/Qwen3-4B-4bit",
+    "mlx-community/Qwen3-14B-4bit",
+)
+
+
+def fleet_max_context(fleet: tuple[str, ...]) -> int:
+    resolved = {r: resolve_context_length(r) for r in fleet}
+    known = {r: c for r, c in resolved.items() if c is not None}
+    for r in fleet:
+        if r not in known:
+            print(f"WARN: no cached config.json for {r}; excluded from "
+                  f"fleet max", file=sys.stderr)
+    if not known:
+        sys.exit("fleet max context unresolvable: no fleet model has a "
+                 "cached config.json — refusing to fall back to a magic "
+                 "constant. Download at least one fleet model first.")
+    return max(known.values())
 
 FILENAME_TS_RE = re.compile(r"req-(\d{8}T\d{6}\.\d+)-\d+\.json")
 
@@ -317,7 +345,7 @@ def audit_ledger(capture_rows: list[dict], ledger_rows: list[dict],
 # Stratum assignment
 # ---------------------------------------------------------------------------
 
-def assign_stratum(tokens: int, limit: int = LOCAL_CONTEXT_LIMIT) -> str | None:
+def assign_stratum(tokens: int, limit: int) -> str | None:
     if tokens < 16000:
         return "shallow"
     if tokens < 40000:
@@ -395,8 +423,8 @@ def _bad_args_reason(tool_calls: list) -> str:
 # Pair extraction and skip rules
 # ---------------------------------------------------------------------------
 
-def process_pairs(chains: list[list[dict]],
-                  qwen_entries: list[dict]) -> list[dict]:
+def process_pairs(chains: list[list[dict]], qwen_entries: list[dict],
+                  count_tokens, limit: int, stats: dict | None = None) -> list[dict]:
     usable = []
     for chain in chains:
         chain_id = chain_stable_id(chain)
@@ -468,12 +496,14 @@ def process_pairs(chains: list[list[dict]],
                           file=sys.stderr)
                 continue
 
-            # Depth stratum (over-limit is excluded)
-            tokens = estimate_prompt_tokens(cap_n["body"])
-            stratum = assign_stratum(tokens)
+            # Depth stratum (over-fleet-max is excluded)
+            tokens = count_tokens(cap_n["body"])
+            stratum = assign_stratum(tokens, limit)
             if stratum is None:
-                print(f"SKIP {pair_label}: over limit ({tokens} > "
-                      f"{LOCAL_CONTEXT_LIMIT})", file=sys.stderr)
+                print(f"SKIP {pair_label}: over limit ({tokens} > {limit})",
+                      file=sys.stderr)
+                if stats is not None:
+                    stats["over_limit"] = stats.get("over_limit", 0) + 1
                 continue
 
             usable.append({
@@ -568,7 +598,9 @@ def depth_weights_from_population(pop_by_stratum: dict) -> dict | None:
 
 def write_meta(output_path: pathlib.Path, corpus_count: int,
                newest_name: str, final_cases: list[dict],
-               coverage: dict, pop_by_stratum: dict) -> pathlib.Path:
+               coverage: dict, pop_by_stratum: dict, *,
+               tokenizer_repo: str, fleet_max: int,
+               over_limit: int) -> pathlib.Path:
     """Persist the corpus snapshot as a sibling ``<stem>.meta.json``.
 
     The captures dir grows over time; the stdout snapshot line alone leaves
@@ -585,6 +617,9 @@ def write_meta(output_path: pathlib.Path, corpus_count: int,
         "depth_weights": depth_weights_from_population(pop_by_stratum),
         "chains_represented": sorted(
             set(c["chain_id"] for c in final_cases)),
+        "tokenizer": tokenizer_repo,
+        "fleet_max_context": fleet_max,
+        "over_limit": over_limit,
     }
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
@@ -607,7 +642,29 @@ def main() -> None:
                     help="output JSONL path")
     ap.add_argument("--sample-per-stratum", type=int, default=5,
                     help="cases to sample per depth stratum (default: 5)")
+    ap.add_argument("--tokenizer", default=REF_TOKENIZER,
+                    help="reference tokenizer repo for exact ref_tokens "
+                         f"counts (default: {REF_TOKENIZER})")
+    ap.add_argument("--fleet", default=",".join(FLEET),
+                    help="comma-separated candidate repos; corpus gate is "
+                         "the max of their native contexts")
     args = ap.parse_args()
+
+    fleet = tuple(r.strip() for r in args.fleet.split(",") if r.strip())
+    limit = fleet_max_context(fleet)
+
+    from transformers import AutoTokenizer
+    try:
+        ref_tok = AutoTokenizer.from_pretrained(args.tokenizer,
+                                                local_files_only=True)
+    except Exception as e:  # noqa: BLE001 - any load failure is fatal
+        sys.exit(f"reference tokenizer {args.tokenizer!r} not loadable from "
+                 f"the local HF cache ({type(e).__name__}: {e}). Run: "
+                 f"hf download {args.tokenizer} — refusing to fall back to "
+                 f"an estimate.")
+
+    def count_tokens(body: dict) -> int:
+        return count_ref_tokens(ref_tok, body)
 
     capture_dir = pathlib.Path(
         args.capture_dir
@@ -639,7 +696,9 @@ def main() -> None:
     newest_name = rows[-1]["name"] if rows else "(none)"
 
     qwen_entries = load_qwen_timestamps(ADEQUACY_LEDGER)
-    usable = process_pairs(chains, qwen_entries)
+    stats: dict = {}
+    usable = process_pairs(chains, qwen_entries, count_tokens, limit,
+                           stats=stats)
 
     pop_by_stratum = {s: 0 for s in STRATA}
     for p in usable:
@@ -723,7 +782,9 @@ def main() -> None:
             print(f"  NOTE: two-chain coverage only in: {', '.join(multi)}")
         print(f"  SINGLE-CHAIN strata: {', '.join(single)}")
     meta_path = write_meta(output_path, corpus_count, newest_name,
-                           final_cases, coverage, pop_by_stratum)
+                           final_cases, coverage, pop_by_stratum,
+                           tokenizer_repo=args.tokenizer, fleet_max=limit,
+                           over_limit=stats.get("over_limit", 0))
     weights = depth_weights_from_population(pop_by_stratum)
     if weights:
         print("Observed depth weights (usable in-scope pairs): "
