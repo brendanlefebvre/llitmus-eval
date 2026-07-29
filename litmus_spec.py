@@ -141,7 +141,7 @@ class ReplayCase:
     capture_path: str
     chain_id: str
     depth_stratum: str          # "shallow" | "mid" | "deep"
-    est_tokens: int
+    ref_tokens: int
     reference: dict             # {acted: bool, tools: list[str], arguments: list[dict]}
     reference_model: Optional[str] = None  # sourced from the case file
 
@@ -302,9 +302,9 @@ def _load_replay_line(obj: dict, ln: int) -> "ReplayCase":
         raise CaseError(
             f"line {ln}: 'depth_stratum' must be one of "
             f"{', '.join(_REPLAY_STRATA)}, got {depth_stratum!r}")
-    est_tokens = _require(obj, "est_tokens", ln)
-    if not isinstance(est_tokens, int) or isinstance(est_tokens, bool):
-        raise CaseError(f"line {ln}: 'est_tokens' must be an integer")
+    ref_tokens = _require(obj, "ref_tokens", ln)
+    if not isinstance(ref_tokens, int) or isinstance(ref_tokens, bool):
+        raise CaseError(f"line {ln}: 'ref_tokens' must be an integer")
     reference = _require(obj, "reference", ln)
     if not isinstance(reference, dict):
         raise CaseError(f"line {ln}: 'reference' must be an object")
@@ -315,7 +315,7 @@ def _load_replay_line(obj: dict, ln: int) -> "ReplayCase":
     if not isinstance(reference.get("arguments"), list):
         raise CaseError(f"line {ln}: reference.arguments must be a list")
     return ReplayCase(id=cid, capture_path=capture_path, chain_id=chain_id,
-                      depth_stratum=depth_stratum, est_tokens=est_tokens,
+                      depth_stratum=depth_stratum, ref_tokens=ref_tokens,
                       reference=reference,
                       reference_model=obj.get("reference_model"))
 
@@ -1108,8 +1108,9 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
             # Truncation gate (F3a): record the token count the model is
             # actually fed by encoding the rendered prompt. This is the only
             # number that can surface silent truncation on deep cases (40–60k
-            # tokens) — est_tokens is the extractor's pre-template estimate
-            # and can't see template overhead or context-window clipping. A
+            # tokens) — ref_tokens is the extractor's reference-tokenizer
+            # count of the canonical render, not a pre-template estimate, and
+            # can't see template overhead or context-window clipping. A
             # tokenizer without encode() (e.g. a stub) records None plus a
             # tokens_fed_error note on the case record rather than crashing
             # the run — a silent None would hide a broken gate.
@@ -1161,7 +1162,7 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
             "score": score, "output_sample": text[:200],
             "thinking_unclosed": not closed,
             "prompt_tokens_fed": prompt_tokens_fed,
-            "est_tokens": case.est_tokens,
+            "ref_tokens": case.ref_tokens,
         }
         if tokens_fed_error is not None:
             rec["tokens_fed_error"] = tokens_fed_error

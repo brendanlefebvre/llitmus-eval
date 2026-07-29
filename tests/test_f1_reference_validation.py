@@ -6,7 +6,7 @@ the replay cases were extracted from. Any systematic failure means the harness
 is measuring itself, not the model (the ``parse_native`` failure mode). That
 is a hard stop until fixed.
 
-Also includes an est_tokens drift check: each case's ``est_tokens`` must match
+Also includes a ref_tokens drift check: each case's ``ref_tokens`` must match
 ``estimate_prompt_tokens`` on the capture body, catching extraction drift.
 
 These are integration tests. They require ``cases/main_replay.jsonl`` to exist
@@ -255,7 +255,7 @@ def test_reference_parsed_calls_validates_all_parallel_calls():
 
     case = ReplayCase(
         id="t-parallel", capture_path="unused", chain_id="c-1",
-        depth_stratum="mid", est_tokens=1,
+        depth_stratum="mid", ref_tokens=1,
         reference={"acted": True, "tools": ["read"], "arguments": []})
     capture_tools = [{"type": "function", "function": {
         "name": "read",
@@ -272,11 +272,11 @@ def test_reference_parsed_calls_validates_all_parallel_calls():
 
 
 # ---------------------------------------------------------------------------
-# est_tokens drift check (formerly mislabelled "F3a")
+# ref_tokens drift check (formerly mislabelled "F3a")
 # ---------------------------------------------------------------------------
 
-def test_est_tokens_drift_check():
-    """est_tokens drift check: each case's est_tokens must match
+def test_ref_tokens_drift_check():
+    """ref_tokens drift check: each case's ref_tokens must match
     estimate_prompt_tokens(capture body).
 
     This is NOT the F3a truncation gate — what exists of that lives in
@@ -303,9 +303,9 @@ def test_est_tokens_drift_check():
             continue
         body = _load_capture(case.capture_path)
         expected = estimate_prompt_tokens(body)
-        if case.est_tokens != expected:
+        if case.ref_tokens != expected:
             mismatches.append(
-                f"  {case.id}: est_tokens={case.est_tokens} but "
+                f"  {case.id}: ref_tokens={case.ref_tokens} but "
                 f"estimate_prompt_tokens={expected}"
             )
 
@@ -314,7 +314,7 @@ def test_est_tokens_drift_check():
               f"{', '.join(skipped)})")
 
     assert not mismatches, (
-        "est_tokens drift: case est_tokens no longer match "
+        "ref_tokens drift: case ref_tokens no longer match "
         "estimate_prompt_tokens(capture body):\n"
         + "\n".join(mismatches)
     )

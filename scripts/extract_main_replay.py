@@ -480,7 +480,7 @@ def process_pairs(chains: list[list[dict]],
                 "capture_path": str(cap_n["path"].resolve()),
                 "chain_id": chain_id,
                 "depth_stratum": stratum,
-                "est_tokens": tokens,
+                "ref_tokens": tokens,
                 "reference": ref,
             })
     return usable
@@ -654,7 +654,7 @@ def main() -> None:
             "capture_path": case["capture_path"],
             "chain_id": case["chain_id"],
             "depth_stratum": case["depth_stratum"],
-            "est_tokens": case["est_tokens"],
+            "ref_tokens": case["ref_tokens"],
             "reference_model": REFERENCE_MODEL,
             "reference": case["reference"],
         })

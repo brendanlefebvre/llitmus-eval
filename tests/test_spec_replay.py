@@ -58,11 +58,11 @@ def _make_capture(tmp_path, name, *, messages=None, tools=None, max_tokens=32000
 
 
 def _replay_case(capture_path, *, id_="mr-001", depth_stratum="mid",
-                 chain_id="chain-01", est_tokens=20000, acted=True,
+                 chain_id="chain-01", ref_tokens=20000, acted=True,
                  tools=None, arguments=None):
     return ReplayCase(
         id=id_, capture_path=capture_path, chain_id=chain_id,
-        depth_stratum=depth_stratum, est_tokens=est_tokens,
+        depth_stratum=depth_stratum, ref_tokens=ref_tokens,
         reference={"acted": acted, "tools": tools or [], "arguments": arguments or []},
     )
 
@@ -76,7 +76,7 @@ def _replay_jsonl(tmp_path, name, *cases):
 def _valid_case_dict(capture_path):
     return {
         "id": "mr-001", "capture_path": capture_path, "chain_id": "chain-01",
-        "depth_stratum": "mid", "est_tokens": 23515,
+        "depth_stratum": "mid", "ref_tokens": 23515,
         "reference": {"acted": True, "tools": ["read"], "arguments": [{"filePath": "x"}]},
     }
 
@@ -96,7 +96,7 @@ class TestLoader:
         assert c.id == "mr-001"
         assert c.capture_path == cap
         assert c.depth_stratum == "mid"
-        assert c.est_tokens == 23515
+        assert c.ref_tokens == 23515
         assert c.reference["acted"] is True
         assert c.reference["tools"] == ["read"]
 
@@ -127,18 +127,18 @@ class TestLoader:
         with pytest.raises(CaseError, match="depth_stratum"):
             load_cases(path, "main-replay")
 
-    def test_est_tokens_must_be_int(self, tmp_path):
+    def test_ref_tokens_must_be_int(self, tmp_path):
         cap = _make_capture(tmp_path, "req-1.json")
-        d = _valid_case_dict(cap); d["est_tokens"] = "23515"
+        d = _valid_case_dict(cap); d["ref_tokens"] = "23515"
         path = _replay_jsonl(tmp_path, "m.jsonl", d)
-        with pytest.raises(CaseError, match="est_tokens"):
+        with pytest.raises(CaseError, match="ref_tokens"):
             load_cases(path, "main-replay")
 
-    def test_est_tokens_rejects_bool(self, tmp_path):
+    def test_ref_tokens_rejects_bool(self, tmp_path):
         cap = _make_capture(tmp_path, "req-1.json")
-        d = _valid_case_dict(cap); d["est_tokens"] = True
+        d = _valid_case_dict(cap); d["ref_tokens"] = True
         path = _replay_jsonl(tmp_path, "m.jsonl", d)
-        with pytest.raises(CaseError, match="est_tokens"):
+        with pytest.raises(CaseError, match="ref_tokens"):
             load_cases(path, "main-replay")
 
     def test_reference_acted_must_be_bool(self, tmp_path):
@@ -1039,7 +1039,7 @@ class TestRunMainReplay:
 
     def test_runner_records_prompt_tokens_fed(self, tmp_path):
         """F3a: each per-case record carries prompt_tokens_fed (the count of
-        tokens the model was actually fed) and est_tokens (the extractor's
+        tokens the model was actually fed) and ref_tokens (the extractor's
         pre-template estimate). prompt_tokens_fed is the only number that can
         surface silent truncation on deep cases.
         """
@@ -1048,7 +1048,7 @@ class TestRunMainReplay:
         cap = _make_capture(tmp_path, "req-1.json", messages=msgs,
                             tools=[READ_TOOL], max_tokens=32000)
         case = _replay_case(cap, acted=True, tools=["read"],
-                            arguments=[{"filePath": "x"}], est_tokens=20000)
+                            arguments=[{"filePath": "x"}], ref_tokens=20000)
         tok = ReplayFakeTokenizer()
 
         seen_prompt = {}
@@ -1062,8 +1062,8 @@ class TestRunMainReplay:
         assert rec["prompt_tokens_fed"] == len(seen_prompt["prompt"].split())
         # sane path: no failure note on the record
         assert "tokens_fed_error" not in rec
-        # est_tokens is echoed from the case for sidecar-side comparison.
-        assert rec["est_tokens"] == 20000
+        # ref_tokens is echoed from the case for sidecar-side comparison.
+        assert rec["ref_tokens"] == 20000
 
 
 # ===========================================================================

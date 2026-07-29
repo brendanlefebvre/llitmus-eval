@@ -342,7 +342,7 @@ class TestSkipRules:
         assert len(usable) == 1  # NOT skipped — outside even ±600s
 
     def test_skip_over_limit(self, tmp_path, capsys):
-        # Need est_tokens > 60000. estimate_prompt_tokens counts chars // 4
+        # Need ref_tokens > 60000. estimate_prompt_tokens counts chars // 4
         # for content + tool schema JSON chars // 4.
         # A 240001-char user message → 60000 tokens (content alone).
         # Need >60000, so 240005 chars → 60001 tokens.
@@ -604,7 +604,7 @@ class TestSampling:
                 "capture_path": f"/fake/{chain_id}-{i}.json",
                 "chain_id": chain_id,
                 "depth_stratum": stratum,
-                "est_tokens": 1000,
+                "ref_tokens": 1000,
                 "reference": {"acted": True, "tools": ["read"],
                               "arguments": [{}]},
             }
@@ -699,7 +699,7 @@ class TestCaseFormat:
             "capture_path": sample[0]["capture_path"],
             "chain_id": sample[0]["chain_id"],
             "depth_stratum": sample[0]["depth_stratum"],
-            "est_tokens": sample[0]["est_tokens"],
+            "ref_tokens": sample[0]["ref_tokens"],
             "reference": sample[0]["reference"],
         }
 
@@ -707,7 +707,7 @@ class TestCaseFormat:
         assert case["capture_path"].startswith("/")
         assert case["chain_id"] == "chain-20260101T000000"
         assert case["depth_stratum"] == "shallow"
-        assert isinstance(case["est_tokens"], int)
+        assert isinstance(case["ref_tokens"], int)
         assert case["reference"]["acted"] is True
         assert case["reference"]["tools"] == ["read"]
         assert case["reference"]["arguments"] == [{"filePath": "f.py"}]
@@ -776,7 +776,7 @@ class TestCaseFormat:
                 "capture_path": c["capture_path"],
                 "chain_id": c["chain_id"],
                 "depth_stratum": c["depth_stratum"],
-                "est_tokens": c["est_tokens"],
+                "ref_tokens": c["ref_tokens"],
                 "reference": c["reference"],
             }
             lines.append(json.dumps(case))
@@ -788,7 +788,7 @@ class TestCaseFormat:
             assert "capture_path" in obj
             assert "chain_id" in obj
             assert "depth_stratum" in obj
-            assert "est_tokens" in obj
+            assert "ref_tokens" in obj
             assert "reference" in obj
 
 
