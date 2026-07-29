@@ -17,13 +17,29 @@
 
 ## Expected outcomes (verify against these, computed 2026-07-29 from the regenerated corpus)
 
-| model | context (source: config) | cases scored | cases errored (over-context) |
-|---|---|---|---|
-| `mlx-community/Llama-3.2-1B-Instruct-4bit` | 131,072 | 15 | none |
-| `mlx-community/Qwen3-4B-4bit` | 40,960 | 11 | exactly `mr-011, mr-012, mr-013, mr-014` |
-| `mlx-community/Qwen3-14B-4bit` | 40,960 | 11 | exactly `mr-011, mr-012, mr-013, mr-014` |
+These are **measured** values from the 2026-07-29 run, not predictions.
 
-Corpus: 15 cases, 5/5/5 by stratum; one deep case (≤40,960 ref tokens) survives the Qwen gate, so deep coverage on the Qwens is reduced (n=1), not vacated. Depth weights come from `cases/main_replay.meta.json` (deep ≈ 0.77) — the headline `action_valid_weighted` will lean heavily on whatever deep evidence exists. For the Qwens that is 1 case; treat their headline accordingly (real, but thin).
+| model | context (source: config) | scored | errored — over-context | errored — other |
+|---|---|---|---|---|
+| `mlx-community/Llama-3.2-1B-Instruct-4bit` | 131,072 | 6 | none | **9** (template, see below) |
+| `mlx-community/Qwen3-4B-4bit` | 40,960 | 11 | exactly `mr-011, mr-012, mr-013, mr-014` | none |
+| `mlx-community/Qwen3-14B-4bit` | 40,960 | 11 | exactly `mr-011, mr-012, mr-013, mr-014` | none |
+
+**Llama-3.2-1B errors 9 of 15 for a non-context reason.** Its chat template
+raises `This model only supports single tool-calls at once!` on any message
+carrying parallel `tool_calls` — at render, in both native and prompted mode, so
+no runner change helps. 9 of 15 corpus cases contain such a message, including
+every deep one. Its `0.00` measures template incompatibility, not capability. An
+earlier draft of this runbook predicted "15 scored, none errored" by reasoning
+from token counts alone; render-time failures are invisible to that reasoning.
+
+**Do not quote the Qwen headline spread as a capability comparison.** The corpus
+is 15 cases, 5/5/5 by stratum, but the 40,960 gate leaves the Qwens exactly
+**one** deep case (`mr-015`) — and `depth_weights` put ≈0.77 on deep. In the
+2026-07-29 run that single case was the entire difference between the 4B's 0.94
+and the 14B's 0.23; shallow and mid were identical (1.00/1.00 with thinking). A
+weighted headline resting on n=1 is a coin flip wearing a decimal point. Report
+per-stratum n beside it, or report coverage instead of a score.
 
 ## Pre-flight
 
@@ -123,19 +139,25 @@ Expected: three `OK` lines matching the table in this document. Every assertion 
 
 For each model note `action_valid_weighted`, the by-depth breakdown, and errored count from the tee'd logs. Two things that would be *wrong* and worth flagging even though step 7 passed: a Qwen model scoring deep cases at n>1 (gate not applied per-mode?), or Llama-1B with any errored case.
 
-- [ ] **9. Commit the sidecars**
+- [ ] **9. Do NOT commit the sidecars — record the findings instead**
 
-```bash
-git add results_main-replay_Llama-3.2-1B.json results_main-replay_Qwen3-4B.json results_main-replay_Qwen3-14B.json
-git commit -m "results: matrix re-run on exact-count corpus with native-context gate
+`results_*.json` is gitignored (`.gitignore:11`), as are `cases/main_replay.jsonl`
+and its `.meta.json` (lines 13–14). Results and corpus are derived artifacts,
+regenerable from captures; captures are the source of truth. `git add` on them
+fails, and `-f` would be wrong. (An earlier draft of this runbook told you to
+commit them — that was incorrect.)
 
-Llama-1B scores all 15 cases (131,072 context); Qwen3-4B/14B score 11
-with mr-011..mr-014 errored as over-context (40,960) instead of being
-scored beyond their window. First matrix where the deep-stratum numbers
-are real.
+Because nothing lands in git, the run's findings have no durable home unless you
+give them one. Write up anything that would otherwise be re-derived next time:
 
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
-```
+- Per-model headline, per-stratum n, peak memory, wall-clock.
+- Any model that errored for a reason **other** than over-context — those are
+  compatibility findings, not scores (see the Llama-3.2 note above).
+- Whether any weighted headline rested on a stratum with n < 3.
+
+Cross-project lessons belong in `~/src/learnings`
+(`~/src/learnings/bin/capture-learning --title "..." --tags "..."`, body on
+stdin). Repo-specific outcomes belong in a dated note under `docs/`.
 
 - [ ] **10. Restart the servers if you stopped them in step 2**, and delete the `/tmp/matrix-*.log` files or leave them (they're outside the repo either way).
 
