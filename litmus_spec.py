@@ -1075,6 +1075,7 @@ def _replay_eta_secs(remaining: list, stratum_secs: dict) -> Optional[float]:
 
 def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
                     enable_thinking=None, depth_weights: dict | None = None,
+                    context_length: int | None = None,
                     progress: Optional[Callable[[str], None]] = None) -> dict:
     """Replay captured LLM request bodies through a local model and score tier-0.
 
@@ -1096,6 +1097,18 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
     per_case_scores, records, errored = [], [], []
     total = len(cases)
     stratum_secs: dict = {}
+    # Resolve the context gate once, before the loop. Explicit config context
+    # takes precedence; otherwise fall back to the tokenizer's declared max
+    # when sane. Many tokenizers ship a huge sentinel (>= 10**9, transformers'
+    # "unset" convention); Qwen3's is real but wrong (the YaRN ceiling, not
+    # native context) — which is why a resolved config context takes precedence.
+    gate_limit: int | None = context_length
+    gate_source: str | None = "config" if context_length is not None else None
+    if gate_limit is None:
+        mml = getattr(tokenizer, "model_max_length", None)
+        if (isinstance(mml, int) and not isinstance(mml, bool)
+                and 0 < mml < 10**9):
+            gate_limit, gate_source = mml, "model_max_length"
     for i, case in enumerate(cases, 1):
         t_case = time.monotonic()
         try:
@@ -1120,19 +1133,15 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
             except Exception as te:  # noqa: BLE001 - surface, don't crash
                 prompt_tokens_fed = None
                 tokens_fed_error = f"{type(te).__name__}: {te}"
-            # Minimum gate: if the tokenizer declares a sane context length
-            # and the rendered prompt exceeds it, scoring would grade a
+            # Minimum gate: if a sane context length was resolved above and the
+            # rendered prompt exceeds it, scoring would grade a
             # silently-truncated generation. Error the case instead (raising
             # routes it through the same errored path as any other failure).
-            # Many tokenizers use a huge sentinel model_max_length; treat
-            # anything >= 10**9 as "no declared limit".
-            if prompt_tokens_fed is not None:
-                mml = getattr(tokenizer, "model_max_length", None)
-                if (isinstance(mml, int) and not isinstance(mml, bool)
-                        and 0 < mml < 10**9 and prompt_tokens_fed > mml):
-                    raise RuntimeError(
-                        f"prompt exceeds model context: "
-                        f"{prompt_tokens_fed} > {mml}")
+            if (prompt_tokens_fed is not None and gate_limit is not None
+                    and prompt_tokens_fed > gate_limit):
+                raise RuntimeError(
+                    f"prompt exceeds model context: "
+                    f"{prompt_tokens_fed} > {gate_limit} ({gate_source})")
             raw = generate_fn(prompt, max_tokens=max_tokens)
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errored.append({"id": case.id, "error": str(e)})
@@ -1177,7 +1186,9 @@ def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
                 i, total, case, outcome, case_secs, cases[i:], stratum_secs))
     return {"aggregate": aggregate_replay(per_case_scores,
                                           depth_weights=depth_weights),
-            "cases": records, "errored": errored}
+            "cases": records, "errored": errored,
+            "context_length": gate_limit,
+            "context_length_source": gate_source}
 
 
 # ---------------------------------------------------------------------------
@@ -1308,6 +1319,8 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
         "cases": result.get("cases", []),
         "errored": result.get("errored", []),
     }
+    payload["context_length"] = result.get("context_length")
+    payload["context_length_source"] = result.get("context_length_source")
     if cost:
         payload["load_ms"] = cost.get("load_ms")
         payload["peak_memory_mb"] = cost.get("peak_memory_mb")
@@ -1359,7 +1372,7 @@ THINKING_MAX_TOKENS = {"tool-calling": 2048, "constraints": 1536, "chore": 4096}
 
 
 def main() -> None:
-    from litmus_common import get_backend, _targets_for
+    from litmus_common import get_backend, _targets_for, resolve_context_length
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1467,6 +1480,7 @@ def main() -> None:
                 result = run_main_replay(cases, tokenizer, gen, native=native,
                                          enable_thinking=flag,
                                          depth_weights=replay_weights,
+                                         context_length=resolve_context_length(repo),
                                          progress=print)
                 print(format_replay_table(f"{label} [{mode}]", result))
             else:

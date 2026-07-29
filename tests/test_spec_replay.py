@@ -1065,6 +1065,51 @@ class TestRunMainReplay:
         # ref_tokens is echoed from the case for sidecar-side comparison.
         assert rec["ref_tokens"] == 20000
 
+    def test_runner_gate_uses_resolved_context_over_tokenizer(self, tmp_path):
+        """A resolved config context must gate even when model_max_length is
+        a large 'real' number — the 2026-07-28 failure: Qwen3's tokenizer
+        says 131072 while the model's native context is 40960."""
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap, acted=True)
+        tok = ReplayFakeTokenizer()
+        tok.model_max_length = 131072  # tokenizer's (wrong) ceiling
+        result = run_main_replay(
+            [case], tok,
+            lambda p, max_tokens=0: '{"tool": "read", "arguments": {"filePath": "f"}}',
+            native=False, context_length=3)
+        assert result["cases"] == []
+        err = result["errored"][0]
+        assert "prompt exceeds model context" in err["error"]
+        assert "> 3" in err["error"]
+        assert result["context_length"] == 3
+        assert result["context_length_source"] == "config"
+
+    def test_runner_gate_falls_back_to_model_max_length(self, tmp_path):
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap, acted=True)
+        tok = ReplayFakeTokenizer()
+        tok.model_max_length = 3
+        result = run_main_replay(
+            [case], tok,
+            lambda p, max_tokens=0: '{"tool": "read", "arguments": {"filePath": "f"}}',
+            native=False, context_length=None)
+        assert result["errored"]  # gated via fallback
+        assert result["context_length"] == 3
+        assert result["context_length_source"] == "model_max_length"
+
+    def test_runner_gate_none_context_none_mml_records_null(self, tmp_path):
+        cap = _make_capture(tmp_path, "req-1.json", tools=[READ_TOOL])
+        case = _replay_case(cap, acted=True)
+        tok = ReplayFakeTokenizer()
+        tok.model_max_length = 10**9  # sentinel -> no declared limit
+        result = run_main_replay(
+            [case], tok,
+            lambda p, max_tokens=0: '{"tool": "read", "arguments": {"filePath": "f"}}',
+            native=False)
+        assert result["errored"] == []
+        assert result["context_length"] is None
+        assert result["context_length_source"] is None
+
 
 # ===========================================================================
 # format_replay_table
