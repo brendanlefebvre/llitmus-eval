@@ -26,6 +26,13 @@ symptom; two upstream defects made it inevitable:
    `config.json`. Every deep case (51k–85k tokens) passed a 131,072 gate and
    was scored as if the results meant something.
 
+**Case-ID namespaces:** IDs cited in this Background (mr-012 = 77,908,
+mr-013 = 85,278) belong to the pre-2026-07-29 corpus generation. The 07-29
+regeneration re-sampled from a grown capture pool (440 captures) and
+reassigned IDs, so Section 4's calibration IDs (mr-008, mr-013) name
+*different* cases — e.g. the new mr-012 is 51,095 tokens. The old numbers
+remain verifiable in the pre-regeneration sidecars.
+
 Verified context lengths:
 
 | model | real context | role |
@@ -99,8 +106,12 @@ for capture classification. That coupling is intended, not an oversight.
 Corpus in-scope gate becomes **fleet max** via `resolve_context_length` over the
 candidate set (131,072 today), replacing `LOCAL_CONTEXT_LIMIT` — including the
 `limit=LOCAL_CONTEXT_LIMIT` default on `assign_stratum`
-(`scripts/extract_main_replay.py:320`). It doesn't bind today — nothing exceeds
-131,072 — but it's now principled rather than arbitrary. `meta.json` gains
+(`scripts/extract_main_replay.py:320`). Under exact counting the gate **binds
+substantially** — the 2026-07-29 regeneration excluded 89 pairs as over
+131,072 (`over_limit: 89` in meta.json), reshaping the deep-stratum
+population (238 vs ~327 under chars//4) and therefore the recomputed depth
+weights. (An earlier draft claimed it wouldn't bind; that was a chars//4-era
+assumption.) `meta.json` gains
 `tokenizer`, `fleet_max_context`, and `over_limit` (a flat count — anything
 over the fleet max is past the deep edge by definition, so a per-stratum
 breakdown would be vacuous) so a snapshot records how it was counted.
@@ -132,10 +143,10 @@ across the 15-case corpus. The value 3.5 was calibrated against
 `Qwen3-14B-4bit` counts (worst under +0.2%, worst over +22.1%) on
 2026-07-29 by `scripts/calibrate_router_divisor.py` — the floor of
 `min(chars/ref_tokens)` over the corpus, so `chars/divisor >= ref_tokens`
-everywhere. (The provisional 3.6 underestimated mr-008 and mr-013, where the
-corpus's chars/token ratio dipped to 3.51; the standing property test in
-`tests/test_router_divisor_property.py` fails loudly if the pinned value ever
-underestimates again.) Deliberately conservative, because the failure modes
+everywhere. (The provisional 3.6 underestimated mr-008 and mr-013; the
+minimum ratio — 3.509, on mr-013 — sets the floor, which lands at 3.5. The
+standing property test in `tests/test_router_divisor_property.py` fails
+loudly if the pinned value ever underestimates again.) Deliberately conservative, because the failure modes
 are asymmetric: undercount → an over-long prompt hits a local model → garbage
 or a crash; overcount → goes to cloud → costs money but works.
 
@@ -194,10 +205,10 @@ that reports context (e.g. vLLM's `max_model_len`).
   premise false (the backend serves the 14B; the 35B is manual-start only on
   this 24 GiB machine). Strata describe the routing population, and the
   routing population is served by the 14B. Consequence: the provisional 3.6
-  divisor was revised to 3.5 by calibration against this tokenizer — the corpus's
-  chars/token ratio dipped to 3.51 on mr-008 and mr-013, so the
-  `min(chars/ref_tokens)` floor landed at 3.5 to keep the estimator from
-  underestimating those cases.
+  divisor was revised to 3.5 by calibration against this tokenizer — 3.6
+  underestimated mr-008 and mr-013 (post-regeneration IDs), and the minimum
+  chars/token ratio, 3.509 on mr-013, floors the `min(chars/ref_tokens)`
+  divisor to 3.5.
 - Context probe: **kept in scope** despite deriving nothing from the current
   mlx_lm backend (verified: its `/v1/models` carries no context field) —
   explicit config wins today; the probe self-activates on a future backend
