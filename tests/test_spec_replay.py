@@ -784,6 +784,45 @@ class TestBuildReplayPrompt:
         assert body["messages"] == msgs
 
 
+class TestCanonicalRefRender:
+    """Corpus-side canonical render: one fixed convention regardless of
+    candidate — messages with tools forwarded natively, no thinking flag."""
+
+    def _body(self):
+        return {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"},
+                ]},
+            ],
+            "tools": [{"type": "function",
+                       "function": {"name": "read", "parameters": {}}}],
+        }
+
+    def test_forwards_tools_natively_no_thinking_flag(self):
+        from litmus_spec import canonical_ref_render
+        tok = ReplayFakeTokenizer()
+        canonical_ref_render(tok, self._body())
+        assert tok.last_tools == self._body()["tools"]
+        assert tok.last_enable_thinking is None
+
+    def test_stringifies_content_part_lists(self):
+        from litmus_spec import canonical_ref_render
+        tok = ReplayFakeTokenizer()
+        canonical_ref_render(tok, self._body())
+        assert isinstance(tok.last_messages[-1]["content"], str)
+        assert "part one" in tok.last_messages[-1]["content"]
+
+    def test_count_ref_tokens_counts_encoded_render(self):
+        from litmus_spec import canonical_ref_render, count_ref_tokens
+        tok = ReplayFakeTokenizer()
+        body = self._body()
+        n = count_ref_tokens(tok, body)
+        assert n == len(tok.encode(canonical_ref_render(tok, body)))
+
+
 # ===========================================================================
 # run_main_replay — end-to-end
 # ===========================================================================

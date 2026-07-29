@@ -919,6 +919,23 @@ def build_replay_prompt(tokenizer, case: "ReplayCase", native: bool,
                  enable_thinking=enable_thinking)
 
 
+def canonical_ref_render(tokenizer, body: dict) -> str:
+    """Render a captured request body the corpus-canonical way.
+
+    One fixed convention — messages with tools forwarded natively, no
+    thinking flag — because a stratum is a property of the corpus, not of a
+    candidate. Per-candidate rendering reality is recorded separately as
+    ``prompt_tokens_fed`` (spec 2026-07-29).
+    """
+    messages = _stringify_content(body["messages"])
+    return _chat(tokenizer, messages, tools=body.get("tools"))
+
+
+def count_ref_tokens(tokenizer, body: dict) -> int:
+    """Exact token count of the canonical render under ``tokenizer``."""
+    return len(tokenizer.encode(canonical_ref_render(tokenizer, body)))
+
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
