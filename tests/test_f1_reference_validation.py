@@ -7,7 +7,8 @@ is measuring itself, not the model (the ``parse_native`` failure mode). That
 is a hard stop until fixed.
 
 Also includes a ref_tokens drift check: each case's ``ref_tokens`` must match
-``estimate_prompt_tokens`` on the capture body, catching extraction drift.
+``count_ref_tokens`` (the corpus's own reference tokenizer) on the capture
+body, catching extraction drift.
 
 These are integration tests. They require ``cases/main_replay.jsonl`` to exist
 (produced by ``scripts/extract_main_replay.py``) and the capture files it
@@ -32,10 +33,10 @@ if str(_SCRIPTS) not in sys.path:
 from litmus_spec import (  # noqa: E402
     ParsedCall,
     ReplayCase,
+    count_ref_tokens,
     load_cases,
     score_replay_call,
 )
-from loxo_llm_router import estimate_prompt_tokens  # noqa: E402
 
 
 CASES_PATH = "cases/main_replay.jsonl"
@@ -150,6 +151,23 @@ def _reference_parsed_calls(n1_body: dict, n_count: int) -> list[ParsedCall]:
 def _capture_tools(capture_path: str) -> list:
     body = _load_capture(capture_path)
     return body.get("tools") or []
+
+
+@pytest.fixture(scope="module")
+def ref_tokenizer():
+    """The corpus's own reference tokenizer, from meta.json; loud skip when
+    it isn't cached — a silent pass would hide a broken drift check."""
+    meta_path = pathlib.Path("cases/main_replay.meta.json")
+    repo = "mlx-community/Qwen3-14B-4bit"
+    if meta_path.exists():
+        repo = json.loads(meta_path.read_text()).get("tokenizer", repo)
+    transformers = pytest.importorskip("transformers")
+    try:
+        return transformers.AutoTokenizer.from_pretrained(
+            repo, local_files_only=True)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"reference tokenizer {repo} not in local HF cache "
+                    f"({type(e).__name__}) — drift check needs it")
 
 
 # ---------------------------------------------------------------------------
@@ -275,26 +293,11 @@ def test_reference_parsed_calls_validates_all_parallel_calls():
 # ref_tokens drift check (formerly mislabelled "F3a")
 # ---------------------------------------------------------------------------
 
-def test_ref_tokens_drift_check():
-    """ref_tokens drift check: each case's ref_tokens must match
-    estimate_prompt_tokens(capture body).
-
-    This is NOT the F3a truncation gate — what exists of that lives in
-    run_main_replay: per-case ``prompt_tokens_fed`` recording (the tokenizer's
-    count of the *rendered* prompt), a ``tokens_fed_error`` note when the
-    tokenizer fails, and an overflow gate that errors any case whose rendered
-    prompt exceeds a sane tokenizer ``model_max_length``. Comparison against
-    what the backend *actually consumed* remains future work. This test
-    instead catches extraction drift: if the estimator's count of the captured
-    prompt no longer matches what the extractor recorded, the case's depth
-    stratum may be wrong. Estimator-vs-itself can't detect truncation, but it
-    can detect a stale case file.
-
-    Skip is per-case (collected into a list) rather than via pytest.skip,
-    which aborts the whole loop on the first missing capture.
-    """
+def test_ref_tokens_drift_check(ref_tokenizer):
+    """Each case's ref_tokens must match count_ref_tokens(reference
+    tokenizer, capture body). Catches a stale case file after either the
+    canonical render or the reference tokenizer changes."""
     cases = _require_cases()
-
     mismatches = []
     skipped = []
     for case in cases:
@@ -302,19 +305,14 @@ def test_ref_tokens_drift_check():
             skipped.append(case.id)
             continue
         body = _load_capture(case.capture_path)
-        expected = estimate_prompt_tokens(body)
+        expected = count_ref_tokens(ref_tokenizer, body)
         if case.ref_tokens != expected:
             mismatches.append(
                 f"  {case.id}: ref_tokens={case.ref_tokens} but "
-                f"estimate_prompt_tokens={expected}"
-            )
-
+                f"count_ref_tokens={expected}")
     if skipped:
         print(f"  (skipped {len(skipped)} case(s) with missing captures: "
               f"{', '.join(skipped)})")
-
     assert not mismatches, (
-        "ref_tokens drift: case ref_tokens no longer match "
-        "estimate_prompt_tokens(capture body):\n"
-        + "\n".join(mismatches)
-    )
+        "ref_tokens drift: case ref_tokens no longer match the reference "
+        "tokenizer's count of the canonical render:\n" + "\n".join(mismatches))
