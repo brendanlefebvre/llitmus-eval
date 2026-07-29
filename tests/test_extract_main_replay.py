@@ -986,3 +986,96 @@ class TestCorpusMeta:
         assert abs(w["deep"] - 106 / 224) < 1e-9
         assert emr.depth_weights_from_population(
             {"shallow": 0, "mid": 0, "deep": 0}) is None
+
+
+# ---------------------------------------------------------------------------
+# Skip rule 4, allowlist mode
+# ---------------------------------------------------------------------------
+
+def _pp_allow(chains, reference_entries, count_tokens=None, limit=131072,
+              stats=None):
+    """process_pairs with the allowlist gate and an empty denylist, so any
+    survivor got there by reference attribution rather than by default."""
+    return emr.process_pairs(chains, [],
+                             count_tokens or (lambda body: 100),
+                             limit, stats=stats,
+                             reference_entries=reference_entries,
+                             gate="allowlist")
+
+
+class TestReferenceAllowlistGate:
+    """The allowlist keeps only ledger-attributed reference turns.
+
+    It restates the corpus definition rather than enumerating contaminants,
+    so replay traffic is excluded without any rule naming it.
+    """
+
+    def _pair(self, tmp_path, cap_name="req-20260727T122717.000000-0003.json"):
+        msgs_a = [sys_msg(), user_msg()]
+        msgs_b = [sys_msg(), user_msg(), assistant_tool_msg(), tool_msg()]
+        write_capture(tmp_path, cap_name, msgs_a)
+        write_capture(tmp_path, "req-20260727T122718.000000-0004.json", msgs_b)
+        return emr.group_chains(emr.load_captures(tmp_path))
+
+    def test_keeps_reference_authored(self, tmp_path):
+        chains = self._pair(tmp_path)
+        # Ledger completion 0.5s after capture arrival, latency 0 → matches.
+        entries = [{"ts": "2026-07-27T12:27:16.500000+00:00", "latency_ms": 0}]
+        assert len(_pp_allow(chains, entries)) == 1
+
+    def test_drops_unattributed(self, tmp_path, capsys):
+        chains = self._pair(tmp_path)
+        assert _pp_allow(chains, []) == []
+        assert "allowlist gate" in capsys.readouterr().err
+
+    def test_drops_traffic_served_by_another_model(self, tmp_path, capsys):
+        """The contamination case: a matrix replay is ledgered under whatever
+        model served it, so it never reaches reference_entries and is dropped
+        without any rule naming that model."""
+        chains = self._pair(tmp_path)
+        # Ledger rows exist for this window, but load_reference_timestamps
+        # filtered them out (served_model != REFERENCE_MODEL), so the
+        # allowlist sees nothing to attribute the capture to.
+        assert _pp_allow(chains, []) == []
+        assert "allowlist gate" in capsys.readouterr().err
+
+    def test_stats_count_unattributed_drops(self, tmp_path):
+        chains = self._pair(tmp_path)
+        stats: dict = {}
+        _pp_allow(chains, [], stats=stats)
+        assert stats["allowlist_unattributed"] == 1
+
+    def test_null_latency_uses_tight_window_unlike_denylist(self, tmp_path):
+        """The window asymmetry that makes the two gates un-shareable.
+
+        A null-latency ledger row 300s away matches under the denylist's wide
+        ±600s window — cautious there, because a match means SKIP. Under the
+        allowlist a match means KEEP, so the same widening would admit any
+        capture within ten minutes of a reference row. It must not.
+        """
+        chains = self._pair(tmp_path)
+        far = [{"ts": "2026-07-27T12:32:17.000000+00:00", "latency_ms": None}]
+        # Denylist: wide window matches, pair is skipped.
+        assert emr.process_pairs(chains, far, lambda b: 100, 131072) == []
+        # Allowlist: tight window does not match, so nothing is attributed.
+        assert _pp_allow(chains, far) == []
+        # And a null-latency row within ±2s does attribute.
+        near = [{"ts": "2026-07-27T12:27:17.500000+00:00", "latency_ms": None}]
+        assert len(_pp_allow(chains, near)) == 1
+
+    def test_load_reference_timestamps_filters_on_served_model(self, tmp_path):
+        ledger = tmp_path / "adequacy.jsonl"
+        ledger.write_text("\n".join(json.dumps(r) for r in [
+            {"class": "main", "served_model": emr.REFERENCE_MODEL,
+             "ts": "2026-07-27T12:00:00+00:00", "latency_ms": 10},
+            {"class": "main", "served_model": "mlx-community/Qwen3-14B-4bit",
+             "ts": "2026-07-27T12:00:01+00:00", "latency_ms": 10},
+            {"class": "title", "served_model": emr.REFERENCE_MODEL,
+             "ts": "2026-07-27T12:00:02+00:00", "latency_ms": 10},
+        ]) + "\n", encoding="utf-8")
+        rows = emr.load_reference_timestamps(ledger)
+        assert len(rows) == 1
+        assert rows[0]["ts"].startswith("2026-07-27T12:00:00")
+
+    def test_load_reference_timestamps_missing_ledger(self, tmp_path):
+        assert emr.load_reference_timestamps(tmp_path / "nope.jsonl") == []

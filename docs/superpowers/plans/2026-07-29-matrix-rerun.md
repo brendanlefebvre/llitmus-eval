@@ -8,6 +8,11 @@
 
 **Where:** `/Users/brendanl/src/llitmus-eval`, branch `token-accounting-context-gate` (or `main` after merge — verify the branch contains commit `9f45112`).
 
+> **Standing invariant — matrix runs never transit loxo.** Drive candidates directly (mlx_vlm on `:7979` locally, OpenRouter directly for cloud candidates), never through the router on `:9090`. Two reasons, and the second is the load-bearing one:
+>
+> 1. Router log spam corrupts timing measurements (the original reason for the direct-to-`:7979` convention).
+> 2. **Anything transiting loxo is captured, and captures are the corpus.** A matrix run routed through the router writes replay traffic into `~/.local/state/loxo-llm-router/` captures, where the next extraction can pick it up as if it were real agent work — the eval quietly starts measuring its own output. The extractor's allowlist gate (`--reference-gate allowlist`, the default) drops anything the ledger doesn't attribute to `z-ai/glm-5.2`, which covers every candidate except one: a matrix run against **the reference model itself** produces captures the allowlist cannot distinguish from genuine references. That case is only preventable here, by not routing.
+
 **Duration estimate:** tens of minutes total. Llama-1B is the slow one now (it legitimately processes prompts up to 106k tokens); the Qwens got faster because their four biggest cases error out in milliseconds at the gate.
 
 ## Expected outcomes (verify against these, computed 2026-07-29 from the regenerated corpus)

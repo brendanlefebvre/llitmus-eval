@@ -164,8 +164,47 @@ def parse_capture_ts(name: str) -> datetime | None:
         return None
 
 
+def load_reference_timestamps(ledger_path: pathlib.Path) -> list[dict]:
+    """Return REFERENCE_MODEL-served ``main`` ledger entries as dicts.
+
+    The allowlist counterpart to :func:`load_qwen_timestamps`. Skip rule 4
+    keeps a pair only when capture N correlates to one of these rows, so the
+    corpus admits references authored by the reference model and nothing
+    else — whatever produced the other traffic.
+
+    Same shape as :func:`load_qwen_timestamps`: ``ts`` is stamped at response
+    completion, so callers subtract ``latency_ms`` to recover arrival.
+    """
+    if not ledger_path.exists():
+        return []
+    out = []
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("class") != "main":
+            continue
+        if REFERENCE_MODEL not in (entry.get("served_model") or ""):
+            continue
+        ts = entry.get("ts")
+        if ts:
+            latency = entry.get("latency_ms")
+            out.append({
+                "ts": ts,
+                "latency_ms": int(latency) if latency is not None else None,
+            })
+    return out
+
+
 def load_qwen_timestamps(ledger_path: pathlib.Path) -> list[dict]:
     """Return Qwen3-14B-served ``main`` ledger entries as dicts.
+
+    Retained for the denylist gate (``--reference-gate denylist``) and its
+    tests. The allowlist is the default; see :func:`load_reference_timestamps`.
 
     Each entry has ``ts`` (ISO string, stamped at response *completion*) and
     ``latency_ms`` (int or None). Callers must subtract ``latency_ms`` from
@@ -236,23 +275,60 @@ def _ts_delta_seconds(capture_ts: datetime, ledger_ts_str: str,
         return None
 
 
+def match_ledger_entry(capture_name: str, entries: list[dict],
+                       *, widen_null_latency: bool) -> dict | None:
+    """Return the ledger entry correlating to ``capture_name``, or None.
+
+    ``widen_null_latency`` selects which direction "conservative" points, and
+    it MUST follow how the caller uses the result:
+
+    * Denylist (skip on match) -> True. A null ``latency_ms`` means arrival
+      cannot be reconstructed, so the wide ±NULL_LATENCY_WINDOW_S window makes
+      a match *more* likely and therefore skips more. Erring toward exclusion.
+    * Allowlist (keep on match) -> False. Here a wide window would *admit*
+      more, so the same widening that is cautious for a denylist is reckless
+      for an allowlist: it would let any capture within ten minutes of a
+      reference-model row into the corpus. Null-latency rows fall back to a
+      tight ±2s comparison against the completion ts instead.
+    """
+    capture_ts = parse_capture_ts(capture_name)
+    if capture_ts is None:
+        return None
+    for entry in entries:
+        latency = entry.get("latency_ms")
+        if latency is None and not widen_null_latency:
+            delta = _ts_delta_seconds(capture_ts, entry["ts"], None)
+            if delta is not None and delta <= 2:
+                return entry
+            continue
+        if _ts_within_window(capture_ts, entry["ts"], latency):
+            return entry
+    return None
+
+
 def is_qwen_authored(capture_name: str,
                      qwen_entries: list[dict]) -> dict | None:
     """Return the matching ledger entry if capture N was Qwen3-14B-served.
 
+    Denylist helper, retained for ``--reference-gate denylist`` and its tests.
     ``qwen_entries`` are the dicts from :func:`load_qwen_timestamps`. The
     returned entry carries the ledger's completion ``ts`` (preserved for log
     clarity) and ``latency_ms``; correlation uses arrival = ts - latency_ms,
     or the wide null-latency window when latency_ms is None.
     """
-    capture_ts = parse_capture_ts(capture_name)
-    if capture_ts is None:
-        return None
-    for entry in qwen_entries:
-        if _ts_within_window(capture_ts, entry["ts"],
-                             entry.get("latency_ms")):
-            return entry
-    return None
+    return match_ledger_entry(capture_name, qwen_entries,
+                              widen_null_latency=True)
+
+
+def is_reference_authored(capture_name: str,
+                          reference_entries: list[dict]) -> dict | None:
+    """Return the matching ledger entry if capture N was REFERENCE_MODEL-served.
+
+    Allowlist helper. Uses the tight null-latency window — see
+    :func:`match_ledger_entry` for why the two gates cannot share it.
+    """
+    return match_ledger_entry(capture_name, reference_entries,
+                              widen_null_latency=False)
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +500,9 @@ def _bad_args_reason(tool_calls: list) -> str:
 # ---------------------------------------------------------------------------
 
 def process_pairs(chains: list[list[dict]], qwen_entries: list[dict],
-                  count_tokens, limit: int, stats: dict | None = None) -> list[dict]:
+                  count_tokens, limit: int, stats: dict | None = None,
+                  reference_entries: list[dict] | None = None,
+                  gate: str = "denylist") -> list[dict]:
     usable = []
     for chain in chains:
         chain_id = chain_stable_id(chain)
@@ -481,20 +559,43 @@ def process_pairs(chains: list[list[dict]], qwen_entries: list[dict],
                           f"(no tool_calls, no content)", file=sys.stderr)
                 continue
 
-            # Skip rule 4: Qwen3-14B-authored turns
-            qwen_entry = is_qwen_authored(cap_n["name"], qwen_entries)
-            if qwen_entry is not None:
-                if qwen_entry.get("latency_ms") is None:
-                    print(f"SKIP {pair_label}: reference plausibly authored "
-                          f"by Qwen3-14B (ledger ts={qwen_entry['ts']}, "
-                          f"null latency_ms — conservative "
-                          f"±{NULL_LATENCY_WINDOW_S}s window)",
+            # Skip rule 4: reference authorship gate.
+            #
+            # allowlist (default): keep ONLY pairs the ledger attributes to
+            # REFERENCE_MODEL. The corpus is *defined* as reference-authored
+            # turns, so this restates the definition rather than enumerating
+            # contaminants — it excludes replay traffic, probes, and anything
+            # not yet invented, without needing to name any of them. The one
+            # case it cannot catch is a matrix run against REFERENCE_MODEL
+            # itself; keep such runs off the router entirely (docs/runbook).
+            #
+            # denylist (legacy): skip pairs attributed to Qwen3-14B. Kept for
+            # comparison runs and to reproduce pre-2026-07-29 corpora.
+            if gate == "allowlist":
+                ref_entry = is_reference_authored(cap_n["name"],
+                                                  reference_entries or [])
+                if ref_entry is None:
+                    print(f"SKIP {pair_label}: no ledger row attributing this "
+                          f"capture to {REFERENCE_MODEL} (allowlist gate)",
                           file=sys.stderr)
-                else:
-                    print(f"SKIP {pair_label}: reference authored by "
-                          f"Qwen3-14B (ledger ts={qwen_entry['ts']})",
-                          file=sys.stderr)
-                continue
+                    if stats is not None:
+                        stats["allowlist_unattributed"] = \
+                            stats.get("allowlist_unattributed", 0) + 1
+                    continue
+            else:
+                qwen_entry = is_qwen_authored(cap_n["name"], qwen_entries)
+                if qwen_entry is not None:
+                    if qwen_entry.get("latency_ms") is None:
+                        print(f"SKIP {pair_label}: reference plausibly authored "
+                              f"by Qwen3-14B (ledger ts={qwen_entry['ts']}, "
+                              f"null latency_ms — conservative "
+                              f"±{NULL_LATENCY_WINDOW_S}s window)",
+                              file=sys.stderr)
+                    else:
+                        print(f"SKIP {pair_label}: reference authored by "
+                              f"Qwen3-14B (ledger ts={qwen_entry['ts']})",
+                              file=sys.stderr)
+                    continue
 
             # Depth stratum (over-fleet-max is excluded)
             tokens = count_tokens(cap_n["body"])
@@ -648,6 +749,13 @@ def main() -> None:
     ap.add_argument("--fleet", default=",".join(FLEET),
                     help="comma-separated candidate repos; corpus gate is "
                          "the max of their native contexts")
+    ap.add_argument("--reference-gate", choices=("allowlist", "denylist"),
+                    default="allowlist",
+                    help="skip rule 4 mode. allowlist (default) keeps only "
+                         f"pairs the ledger attributes to {REFERENCE_MODEL}, "
+                         "so replay traffic and probes are excluded without "
+                         "being enumerated. denylist reproduces the legacy "
+                         "behaviour: skip only Qwen3-14B-authored pairs.")
     args = ap.parse_args()
 
     fleet = tuple(r.strip() for r in args.fleet.split(",") if r.strip())
@@ -696,9 +804,31 @@ def main() -> None:
     newest_name = rows[-1]["name"] if rows else "(none)"
 
     qwen_entries = load_qwen_timestamps(ADEQUACY_LEDGER)
+    reference_entries = load_reference_timestamps(ADEQUACY_LEDGER)
+    print(f"Reference gate: {args.reference_gate} "
+          f"({len(reference_entries)} ledger rows served by {REFERENCE_MODEL}, "
+          f"{len(qwen_entries)} by Qwen3-14B)")
+    if args.reference_gate == "allowlist" and not reference_entries:
+        sys.exit(
+            f"allowlist gate selected but the ledger at {ADEQUACY_LEDGER} has "
+            f"no main-class rows served by {REFERENCE_MODEL}. Every pair would "
+            f"be dropped and the corpus would be silently empty. Check the "
+            f"ledger path and REFERENCE_MODEL, or pass "
+            f"--reference-gate denylist to reproduce the legacy behaviour."
+        )
     stats: dict = {}
     usable = process_pairs(chains, qwen_entries, count_tokens, limit,
-                           stats=stats)
+                           stats=stats, reference_entries=reference_entries,
+                           gate=args.reference_gate)
+    if args.reference_gate == "allowlist":
+        unattributed = stats.get("allowlist_unattributed", 0)
+        print(f"Allowlist gate: {len(usable)} pairs attributed to "
+              f"{REFERENCE_MODEL}, {unattributed} dropped as unattributed")
+        if usable and unattributed / (unattributed + len(usable)) > 0.5:
+            print("WARN: the allowlist dropped over half of all pairs. That is "
+                  "expected if the ledger post-dates some captures, and a bug "
+                  "otherwise — compare against --reference-gate denylist "
+                  "before trusting this corpus.", file=sys.stderr)
 
     pop_by_stratum = {s: 0 for s in STRATA}
     for p in usable:
