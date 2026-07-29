@@ -1040,8 +1040,9 @@ class TestRunMainReplay:
     def test_runner_records_prompt_tokens_fed(self, tmp_path):
         """F3a: each per-case record carries prompt_tokens_fed (the count of
         tokens the model was actually fed) and ref_tokens (the extractor's
-        pre-template estimate). prompt_tokens_fed is the only number that can
-        surface silent truncation on deep cases.
+        reference-tokenizer count of the canonical render, NOT a pre-template
+        estimate). prompt_tokens_fed is the only number that can surface
+        silent truncation on deep cases.
         """
         msgs = [{"role": "system", "content": "sys"},
                 {"role": "user", "content": "read the file"}]
