@@ -583,10 +583,10 @@ class TestStratumAssignment:
 
     def test_mid_boundary(self):
         assert emr.assign_stratum(16000, 60000) == "mid"
-        assert emr.assign_stratum(39999, 60000) == "mid"
+        assert emr.assign_stratum(31999, 60000) == "mid"
 
     def test_deep_boundary(self):
-        assert emr.assign_stratum(40000, 60000) == "deep"
+        assert emr.assign_stratum(32000, 60000) == "deep"
         assert emr.assign_stratum(60000, 60000) == "deep"
 
     def test_over_limit_excluded(self):

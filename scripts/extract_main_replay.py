@@ -52,10 +52,20 @@ REFERENCE_MODEL = "z-ai/glm-5.2"
 # the local HF cache before extraction runs.
 REF_TOKENIZER = "mlx-community/Qwen3-14B-4bit"
 
-# Candidate models the corpus must be in-scope for; the corpus gate is the
-# max of their native contexts (spec 2026-07-29, "fleet max").
+# Models that are actually SCORED. The corpus gate is the max of their native
+# contexts, which makes it an honest capability ceiling: every case in the
+# corpus can be processed by at least one candidate. Do not add a model here to
+# widen the gate -- a gate held open by something that cannot score the cases it
+# admits manufactures the appearance of coverage (see 2026-07-29 below).
+#
+# Llama-3.2-1B-Instruct-4bit was removed 2026-07-29. Its chat template raises
+# "This model only supports single tool-calls at once!" on any message with
+# parallel tool_calls -- at render, in both native and prompted mode -- which is
+# 9 of 15 sampled cases and every deep one. It held the gate open at 131,072
+# while being unable to score a single case it admitted.
 FLEET = (
-    "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "mlx-community/Qwen3-0.6B-4bit",
+    "mlx-community/Qwen3-1.7B-4bit",
     "mlx-community/Qwen3-4B-4bit",
     "mlx-community/Qwen3-14B-4bit",
 )
@@ -421,10 +431,21 @@ def audit_ledger(capture_rows: list[dict], ledger_rows: list[dict],
 # Stratum assignment
 # ---------------------------------------------------------------------------
 
+# Strata edges, re-cut 2026-07-29 from 16,000/40,000 to 16,000/32,000.
+# Measured over 444 usable pairs, only 16.4% fall within the fleet's 40,960
+# ceiling; the old "deep" edge at 40,000 left a 960-token sliver that could not
+# be populated, so the highest-weighted stratum carried n=1 and one coin-flip
+# case swung the weighted headline by 0.71. At 16,000/32,000 the reachable
+# population splits 27/29/17, all three samplable. "deep" now means "the
+# deepest traffic a local candidate can actually process".
+STRATUM_EDGES = (16000, 32000)
+
+
 def assign_stratum(tokens: int, limit: int) -> str | None:
-    if tokens < 16000:
+    lo, hi = STRATUM_EDGES
+    if tokens < lo:
         return "shallow"
-    if tokens < 40000:
+    if tokens < hi:
         return "mid"
     if tokens <= limit:
         return "deep"
@@ -701,7 +722,8 @@ def write_meta(output_path: pathlib.Path, corpus_count: int,
                newest_name: str, final_cases: list[dict],
                coverage: dict, pop_by_stratum: dict, *,
                tokenizer_repo: str, fleet_max: int,
-               over_limit: int) -> pathlib.Path:
+               over_limit: int,
+               routing_population: dict | None = None) -> pathlib.Path:
     """Persist the corpus snapshot as a sibling ``<stem>.meta.json``.
 
     The captures dir grows over time; the stdout snapshot line alone leaves
@@ -721,6 +743,12 @@ def write_meta(output_path: pathlib.Path, corpus_count: int,
         "tokenizer": tokenizer_repo,
         "fleet_max_context": fleet_max,
         "over_limit": over_limit,
+        "stratum_edges": list(STRATUM_EDGES),
+        # What the corpus does NOT measure. over_limit alone reads as a
+        # footnote; expressed as a share of all otherwise-usable pairs it is
+        # the headline: traffic beyond every local candidate's context, which
+        # the router sends to cloud by construction (Rule 3).
+        "routing_population": routing_population or {},
     }
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
@@ -911,10 +939,32 @@ def main() -> None:
         if multi:
             print(f"  NOTE: two-chain coverage only in: {', '.join(multi)}")
         print(f"  SINGLE-CHAIN strata: {', '.join(single)}")
+    # Routing population: what the corpus can and cannot speak to. Pairs that
+    # reached the depth gate are either in scope (sampled from) or beyond every
+    # candidate's context. The latter is not missing coverage to apologise for
+    # -- it is the measured share of real traffic that must go to cloud.
+    _beyond = stats.get("over_limit", 0)
+    _within = len(usable)
+    _considered = _within + _beyond
+    routing_population = {
+        "pairs_considered": _considered,
+        "within_fleet_max": _within,
+        "beyond_fleet_max": _beyond,
+        "beyond_fleet_max_pct": (round(100.0 * _beyond / _considered, 1)
+                                 if _considered else None),
+        "fleet_max_context": limit,
+    }
+    if _considered:
+        print(f"Routing population: {_beyond}/{_considered} pairs "
+              f"({routing_population['beyond_fleet_max_pct']}%) exceed the "
+              f"fleet ceiling of {limit:,} and are cloud-routed by "
+              f"construction; the corpus measures the remaining {_within}.")
+
     meta_path = write_meta(output_path, corpus_count, newest_name,
                            final_cases, coverage, pop_by_stratum,
                            tokenizer_repo=args.tokenizer, fleet_max=limit,
-                           over_limit=stats.get("over_limit", 0))
+                           over_limit=_beyond,
+                           routing_population=routing_population)
     weights = depth_weights_from_population(pop_by_stratum)
     if weights:
         print("Observed depth weights (usable in-scope pairs): "
