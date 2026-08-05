@@ -15,7 +15,15 @@ script and pastes the output.
 
 Prints a per-case table, the raw and safety-adjusted divisors, and worst-case
 under/over margins at the value it recommends. Paste that value into
-loxo_llm_router/__init__.py.
+loxo_llm_router/__init__.py, and repin it in loxo's test_routing.py
+(test_estimate_divisor_is_pinned) — that pin is what makes a divisor edit
+fail in the repo that runs CI.
+
+Run with --emit-ref-table whenever you repin. It writes the per-case
+(chars, ref_tokens) integers to cases/main_replay.divisor_ref.json; committing
+that file is what lets tests/test_router_divisor_property.py verify the pinned
+divisor on machines without the corpus, the captures, or transformers — which
+is every machine but this one.
 """
 import argparse
 import json
@@ -37,11 +45,58 @@ from loxo_llm_router import _count_prompt_chars       # noqa: E402
 SAFETY = 0.95
 
 
+# Committed alongside the case file: the two integers per case that the
+# calibration actually turns on. See _write_ref_table for why this exists.
+REF_TABLE = "cases/main_replay.divisor_ref.json"
+
+
+def _write_ref_table(path: str, tokenizer: str, cases_path: str,
+                     rows: list, divisor: float) -> None:
+    """Record (case_id, chars, ref_tokens) so the guard can run off-corpus.
+
+    The corpus itself cannot be committed -- it points at capture files
+    containing real conversation content, and computing ref_tokens needs
+    transformers plus a locally cached tokenizer. The consequence, before this
+    existed, was that tests/test_router_divisor_property.py skipped on every
+    machine but the one that generated the corpus, and a skip reports green:
+    the divisor's only guard was silently absent wherever it was most likely
+    to be edited.
+
+    These two integers per case are the entire input to the calibration --
+    everything downstream is arithmetic on them. Committing them makes the
+    pinned divisor checkable anywhere, with no content leaving the machine
+    (ids, counts, and hashes only, same discipline as extract_main_replay).
+
+    A snapshot cannot notice the corpus changing -- regenerate it whenever you
+    regenerate the corpus. It catches the failure that actually happens: the
+    divisor edited without recalibration.
+    """
+    payload = {
+        "tokenizer": tokenizer,
+        "cases_path": cases_path,
+        "safety": SAFETY,
+        "recommended_divisor": divisor,
+        "n_cases": len(rows),
+        "cases": [{"id": cid, "chars": chars, "ref_tokens": real}
+                  for cid, chars, real, _ in sorted(rows, key=lambda r: r[0])],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    print(f"\nreference table written: {path} ({len(rows)} cases) — commit it, "
+          f"it is what lets the property test run off this machine")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cases", default="cases/main_replay.jsonl")
     ap.add_argument("--tokenizer",
                     default="mlx-community/Qwen3-14B-4bit")
+    ap.add_argument("--emit-ref-table", nargs="?", const=REF_TABLE, default=None,
+                    metavar="PATH",
+                    help=f"write the per-case (chars, ref_tokens) table to PATH "
+                         f"(default {REF_TABLE}) so the property test can verify "
+                         f"the pinned divisor without the corpus or a tokenizer")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -80,6 +135,10 @@ def main() -> None:
                for _, chars, real, _ in rows]
     if min(margins) < 0:
         sys.exit("floor produced an undercount — investigate before pinning")
+
+    if args.emit_ref_table:
+        _write_ref_table(args.emit_ref_table, args.tokenizer, args.cases,
+                         rows, divisor)
 
 
 if __name__ == "__main__":
