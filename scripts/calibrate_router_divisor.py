@@ -115,6 +115,11 @@ def main() -> None:
         real = count_ref_tokens(tok, body)
         rows.append((case.id, chars, real, chars / real))
 
+    if not rows:
+        sys.exit(f"no cases loaded from {args.cases!r} -- the corpus is empty "
+                 f"or all lines are blank. Regenerate it with "
+                 f"scripts/extract_main_replay.py before calibrating.")
+
     rows.sort(key=lambda r: r[3])
     print(f"{'case':8} {'chars':>10} {'ref_tokens':>10} {'chars/tok':>10}")
     for cid, chars, real, ratio in rows:

@@ -122,6 +122,13 @@ def resolve_context_length(repo: str) -> int | None:
             cfg = json.load(f)
     except (OSError, ValueError):
         return None
+    if not isinstance(cfg, dict):
+        # A top-level array/string/number parses cleanly, then .get() below
+        # raises AttributeError -- which the clause above does NOT catch, so it
+        # escapes resolve_context_length() and aborts the run. The contract is
+        # None for anything unusable. (loxo's mirror of this function,
+        # _read_hf_cache_config, guards the same shape.)
+        return None
     for scope in (cfg, cfg.get("text_config") or {}):
         if not isinstance(scope, dict):
             continue

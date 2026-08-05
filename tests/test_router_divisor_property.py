@@ -34,8 +34,26 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CASES = REPO_ROOT / "cases" / "main_replay.jsonl"
 REF_TABLE = REPO_ROOT / "cases" / "main_replay.divisor_ref.json"
 
-# Set by whichever path(s) actually compared estimates; read by the final test.
+# Recorded for diagnostics only -- test_divisor_guard_actually_ran does NOT
+# read this, precisely so it survives xdist, random ordering, and -k selection.
 _ran: set = set()
+
+
+def _evidence_available() -> bool:
+    """Could either evidence path run in THIS environment?
+
+    Mirrors the skip conditions of the two checks above. Deliberately
+    independent of whether they actually executed in this process.
+    """
+    if REF_TABLE.exists():
+        return True
+    if not CASES.exists():
+        return False
+    try:                      # the live path additionally needs transformers
+        import transformers   # noqa: F401
+    except Exception:         # noqa: BLE001
+        return False
+    return True
 
 
 def _assert_no_undercounts(pairs, source: str) -> None:
@@ -127,12 +145,19 @@ def test_estimator_never_underestimates_on_corpus(ref_tokenizer):
 # --- the anti-silent-skip check --------------------------------------------
 
 def test_divisor_guard_actually_ran():
-    """Ordered last on purpose: it reports on the tests above.
+    """A guard that skips is not a guard: a run where no evidence path could
+    execute proved nothing about ESTIMATE_CHARS_PER_TOKEN and must not read
+    as green.
 
-    A guard that skips is not a guard. If neither evidence path ran, this run
-    proved nothing about ESTIMATE_CHARS_PER_TOKEN and must not read as green.
+    Preconditions are RECOMPUTED here rather than read from what earlier tests
+    recorded. Deriving this from shared module state coupled it to in-process,
+    file-order execution, so three ordinary setups produced a false failure
+    with a misleading message: pytest-xdist puts the writers in other workers,
+    a random-order plugin can run this first, and -k / a node id skips them
+    entirely. The question "was any evidence available" is answerable on its
+    own, so it should be asked directly.
     """
-    if _ran:
+    if _evidence_available():
         return
     msg = (
         "the divisor guard did not execute — neither the recorded table nor "

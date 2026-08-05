@@ -69,6 +69,18 @@ def test_unparseable_config_returns_none(monkeypatch, tmp_path):
     assert resolve_context_length("org/model") is None
 
 
+def test_non_dict_config_returns_none(monkeypatch, tmp_path):
+    """A top-level array parses cleanly, so json.load succeeds and the
+    OSError/ValueError guard never fires -- the AttributeError from .get()
+    would escape the resolver and abort the run."""
+    for payload in ("[1, 2, 3]", '"a string"', "42"):
+        p = tmp_path / "config.json"
+        p.write_text(payload, encoding="utf-8")
+        monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
+                            lambda repo_id, filename: str(p))
+        assert resolve_context_length("org/model") is None, payload
+
+
 def test_bool_true_is_not_a_context_length(monkeypatch, tmp_path):
     # bool is an int subclass; a config with True must not resolve to 1.
     _fake_cache(monkeypatch, tmp_path, {"max_position_embeddings": True})
