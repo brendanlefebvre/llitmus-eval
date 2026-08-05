@@ -6,10 +6,16 @@ default is what let 51k–85k-token cases score on a 40,960-context model
 """
 import json
 
-import huggingface_hub
 import pytest
 
 from litmus_common import resolve_context_length
+
+# Module-scope `import huggingface_hub` made this file a COLLECTION error on
+# any machine without the dep, and a collection error aborts the whole pytest
+# run -- taking every unrelated test with it, including the divisor guard in
+# test_router_divisor_property.py. Skip this module instead; the tests here
+# genuinely need the real API surface to monkeypatch.
+huggingface_hub = pytest.importorskip("huggingface_hub")
 
 
 def _fake_cache(monkeypatch, tmp_path, config: dict | None):
