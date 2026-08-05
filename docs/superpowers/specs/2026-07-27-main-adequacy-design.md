@@ -2,7 +2,9 @@
 
 **Status:** Proposed — design only, no implementation. Revised 2026-07-28 per
 measurement review (chain structure, authoritative depth profile, reference-set
-identity, weighting, F3 split, confound). A recommendation to argue with.
+identity, weighting, F3 split, confound). Revised again 2026-07-28 post
+code-review: prompted-mode convention resolved, F1 made per-dimension. A
+recommendation to argue with.
 **Date:** 2026-07-27, revised 2026-07-28
 **Inputs:** 137 captures (129 `main`) in `~/.local/state/loxo-llm-router/captures/`,
 the Litmus tool-calling profile, the Loxo adequacy ledger, learnings entries of
@@ -72,17 +74,38 @@ Pure validators in the existing `litmus_spec.py` style, no judgment:
 - `well_formed` — the action parses, via the existing `parse_native` /
   `parse_prompted` machinery, under the same fixed-convention rule as the
   tool-calling profile (native `tools=` where supported, prompted JSON
-  otherwise; report which).
+  otherwise; report which). **For non-native models the prompted convention
+  must be shown to the model:** `_PROMPTED_SYSTEM` plus the request's own tool
+  schemas are appended as an additional system message. This is the sole
+  deliberate deviation from body-verbatim, and it exists because the captured
+  system prompt teaches the serving harness's native protocol, not the litmus
+  prompted shape — grading a model on a format it was never shown measures the
+  harness, not the model (2026-07-28 review, verified: all three increment-1
+  candidates register non-native, so an uninstructed prompted path would have
+  been the *only* path exercised). Everything else in the body stays verbatim.
 - `tool_exists` — named tool is one of the 11 in the request's own `tools`
   array.
 - `args_schema_ok` — required keys present, types correct, **no hallucinated
   keys**. Schema-validation, deliberately *not* the tool-calling profile's
   exact-value equality: at a real mid-session decision point there is no single
   correct argument value, but there is exactly one schema.
-- Thinking-budget guard: an unclosed `<think>` scores all-false, as in the
-  existing profiles.
+- Thinking-budget guard: an unclosed `<think>` means nothing was produced;
+  scoring follows the dimension-applicability rule below (`acted_ok=False`,
+  remaining dimensions `None`).
 
-`action_valid` = all of the above per case. This is the hard gate: a model
+**Dimension applicability rule (2026-07-28):** a dimension that is not
+applicable to a case is `None`, never `False` — `False` means "checked and
+failed," `None` means "not a meaningful question here" (e.g. `well_formed`
+when the model chose prose without ever attempting a call; every unproduced
+dimension after a thinking-budget overrun, where only `acted_ok=False`
+stands). `by_dimension` rates skip `None` and report each dimension's
+applicable-case denominator alongside the rate — a rate over an unstated
+denominator is what made `loose` useless. A `False` on an inapplicable case
+would double-count one underlying failure across several dimensions and
+destroy the breakdown's diagnostic value.
+
+`action_valid` = all *applicable* dimensions passed, per case. This is the
+hard gate: a model
 failing tier 0 at rate X will burn approximately X% of production turns,
 because these are the same signals the adequacy ledger already records live
 (`had_tool_calls`, `tool_calls_valid_json`, `finish_reason`). **Tier 0 offline
@@ -185,7 +208,7 @@ with aggregate:
 {
   "reference_model": "z-ai/glm-5.2",
   "action_valid_weighted": 0.91,
-  "by_dimension": {"acted_ok": ..., "well_formed": ..., "tool_exists": ..., "args_schema_ok": ...},
+  "by_dimension": {"acted_ok": {"rate": ..., "n_applicable": ...}, "well_formed": {...}, "tool_exists": {...}, "args_schema_ok": {...}},
   "tool_agreement": 0.61,
   "action_class_agreement": 0.78,
   "by_depth": {
@@ -193,19 +216,49 @@ with aggregate:
     "mid":     {...},
     "deep":    {...}
   },
-  "by_chain": {"chain-01": {"action_valid": ..., "n": ...}, "chain-10": {...}},
-  "depth_weights": {"shallow": 0.075, "mid": 0.383, "deep": 0.542},
+  "by_chain": {"chain-20260728T115606": {"action_valid": ..., "n": ...}, ...},
+  "depth_weights": {"shallow": 0.129, "mid": 0.397, "deep": 0.473},
+  "depth_weights_source": "corpus-meta",
+  "depth_weight_coverage": 1.0,
   "n_cases": 15
 }
 ```
 
-(Values illustrative; weights are the measured in-scope traffic shares
-9/46/65 over 120.) Equal-N sampling per stratum is correct for measuring the
+(Values illustrative. **Weights are computed by the extractor on every corpus
+walk** — the observed in-scope usable-pair distribution — and persisted in the
+case file's `.meta.json` sibling, which the runner consumes. There is no
+static fallback: a case file without usable meta weights reports
+`action_valid_weighted: null` with `depth_weights_source: "missing"` — the
+applicability rule applied to the headline itself. A number we cannot compute
+is `null`, never a stale stand-in; `by_depth` still carries the per-stratum
+rates, which are the actual data.) Equal-N sampling per stratum is correct for measuring the
 depth *curve* — equal precision per point — but a pooled rate over an equal-N
 sample would describe a traffic mix that does not exist. So the sidecar reports
 **`action_valid_weighted`** — per-stratum rates weighted by the observed
 in-scope depth distribution — and **no unweighted pooled number exists in the
 sidecar at all**.
+
+**Renormalization rule (2026-07-28):** when a stratum contributes zero scored
+cases (e.g. every deep case errored), its weight is not silently dropped —
+that would make "all deep cases crashed" indistinguishable from "all deep
+cases failed." The weighted rate renormalizes over the strata actually
+present, and **`depth_weight_coverage`** (Σ weights of present strata; 1.0
+when all three report) is published beside it so a shrunken evidence base is
+visible, never implicit. Chain ids are derived from the first capture's
+timestamp stem, not enumeration order, so `by_chain` is comparable across
+extractions.
+
+**Outcome categories (2026-07-28, from the first live run):** results are
+reported as three categories, never two plus a hole: *rendered-and-valid*,
+*rendered-and-invalid*, and *could-not-render*. Could-not-render — e.g.
+Llama-3.2's template refusing any conversation history containing parallel
+tool calls, 10 of 15 cases — is an adequacy failure of a **distinct kind**:
+in production, a template that cannot render the prompt means routing there
+fails outright, which is the routing-relevant outcome. It gets its own
+category rather than a footnote because the remedy differs (a harness might
+fix a template; it cannot fix the model), and because "0.00 on 5 of 15"
+invites the question of what happened to the other ten — the honest answer
+is worse for the model than silence implies.
 
 The eventual `adequacy_scores.json` entry for `class=main` is `{model,
 reference_model, action_valid_weighted, tool_agreement, by_depth}` plus the
@@ -265,16 +318,28 @@ or failure-to-act at all.
 
 - **F1 — reference self-validation.** Run the tier-0 validators over the
   *reference actions themselves*. They are real production actions from
-  glm-5.2; they must pass ≈100%. Any systematic failure means the harness is
-  measuring itself, not the model (the `parse_native` failure mode). Hard stop
-  until fixed.
+  glm-5.2; they must pass ≈100% — **reported and gated per dimension**
+  (`acted_ok`, `well_formed`, `tool_exists`, `args_schema_ok` each ≈1.0, with
+  uncheckable dimensions excluded from denominators per `_rate()` semantics),
+  never as one pooled number. The diagnostic value of F1 is *which* dimension
+  fails: `args_schema_ok` failures indict the schema validator, `well_formed`
+  the parser (the `parse_native` failure mode), `acted_ok` the reference
+  extraction. A pooled rate hides exactly that signal. Any systematic failure
+  means the harness is measuring itself, not the model. Hard stop until fixed.
 - **F2 — known-good/known-bad separation.** Llama-3.2-1B vs Qwen3-14B on
   `action_valid`. The chore eval showed the 1B matching the 14B on compliance;
   if that happens *here* — the 1B holding a high valid-action rate on 11-tool,
   15k+-token contexts — then tier 0 has no discriminating power for `main` and
   the gate is falsified. Expected result: the 1B collapses; if it does not,
   this design is wrong and the honest conclusion is that mechanical validity
-  does not separate models on this class.
+  does not separate models on this class. **Comparison rule (2026-07-28):**
+  state F2 as shallow-vs-shallow between models plus the larger model's own
+  depth curve — never headline-vs-headline when `depth_weight_coverage`
+  differs (a 0.13-coverage number against a 1.0-coverage number is not a
+  comparison; say so rather than letting them sit side by side). Report cost
+  alongside any rejection: a model rejected on measured merit (the 1B:
+  5.7 s/case, 2.5 GB peak — genuinely cheap, genuinely inadequate) is the
+  instrument working, not an assumption confirmed.
 - **F3a — no truncation (hard gate, checked directly).** For every case,
   compare the tokenizer's count of the prompt actually fed to the model against
   the case's expected length. Any mismatch is a harness bug (truncation,
@@ -407,6 +472,19 @@ sidecar, not silently.
   scores as agreement all the same.
 - **Edit and code quality.** `args_schema_ok` does not mean the edit compiles,
   the bash command is safe, or the code is right. Nothing executes.
+- **Fabricated completion is detected only when the reference acted.** Live
+  worked example (mr-005, 2026-07-28): Llama-3.2-1B emitted a fake
+  `{"status": "success", ...}` object claiming the work was already done —
+  parroting a commit message from its own context — and was caught solely
+  because the reference acted, so `acted_ok` failed on the mismatch. Had the
+  correct next move been prose, the same fabricated success would have
+  scored `acted_ok=True` and passed tier 0. Tier 1 does not close this
+  either: a fake success and a genuine prose answer are both *respond*-class,
+  so `action_class_match` passes. This is the over-acting blind spot
+  inverted, and the more dangerous half — a malformed call fails loudly; a
+  fabricated success is a lie the agentic loop acts on. Only content-level
+  judgment (tier 2, or production signals) can catch it on prose-reference
+  turns.
 - **Prose-turn quality.** When the right move is to answer the user in text,
   only the act-vs-respond decision is scored, not the answer.
 - **Goal achievement.** Whether the session accomplished what the user wanted

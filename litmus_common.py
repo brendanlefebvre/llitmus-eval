@@ -101,3 +101,39 @@ def _targets_for(args) -> list[tuple[str, str]]:
         return [(label, args.repo)]
     return [(size, MODELS[size]) for size in _parse_sizes(args.sizes)]
 
+
+def resolve_context_length(repo: str) -> int | None:
+    """Native context length for a model repo, from config.json in the HF cache.
+
+    Precedence: top-level ``max_position_embeddings``, then
+    ``text_config.max_position_embeddings`` (Qwen3.6 / gemma-4 / Qwen3-VL
+    nest it). Returns None when the config is not cached, unparseable, or
+    carries neither key — the caller decides the fallback. A silent default
+    here is what produced the 2026-07-28 over-context scoring bug.
+    """
+    import json
+    from huggingface_hub import try_to_load_from_cache
+
+    path = try_to_load_from_cache(repo_id=repo, filename="config.json")
+    if not isinstance(path, str):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cfg, dict):
+        # A top-level array/string/number parses cleanly, then .get() below
+        # raises AttributeError -- which the clause above does NOT catch, so it
+        # escapes resolve_context_length() and aborts the run. The contract is
+        # None for anything unusable. (loxo's mirror of this function,
+        # _read_hf_cache_config, guards the same shape.)
+        return None
+    for scope in (cfg, cfg.get("text_config") or {}):
+        if not isinstance(scope, dict):
+            continue
+        v = scope.get("max_position_embeddings")
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    return None
+

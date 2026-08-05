@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -132,6 +133,17 @@ class ToolCase:
     prompt: str
     tools: list   # list[dict] JSON-Schema
     expect: dict  # {"tool": str|None, "arguments": dict}
+
+
+@dataclass
+class ReplayCase:
+    id: str
+    capture_path: str
+    chain_id: str
+    depth_stratum: str          # "shallow" | "mid" | "deep"
+    ref_tokens: int
+    reference: dict             # {acted: bool, tools: list[str], arguments: list[dict]}
+    reference_model: Optional[str] = None  # sourced from the case file
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +282,44 @@ def _load_tool_line(obj: dict, ln: int) -> "ToolCase":
     return ToolCase(id=cid, prompt=prompt, tools=tools, expect=expect)
 
 
+_REPLAY_STRATA = ("shallow", "mid", "deep")
+
+
+def _load_replay_line(obj: dict, ln: int) -> "ReplayCase":
+    cid = _require(obj, "id", ln)
+    if not isinstance(cid, str):
+        raise CaseError(f"line {ln}: 'id' must be a string")
+    capture_path = _require(obj, "capture_path", ln)
+    if not isinstance(capture_path, str):
+        raise CaseError(f"line {ln}: 'capture_path' must be a string")
+    if not os.path.exists(capture_path):
+        raise CaseError(f"line {ln}: 'capture_path' does not exist: {capture_path}")
+    chain_id = _require(obj, "chain_id", ln)
+    if not isinstance(chain_id, str):
+        raise CaseError(f"line {ln}: 'chain_id' must be a string")
+    depth_stratum = _require(obj, "depth_stratum", ln)
+    if depth_stratum not in _REPLAY_STRATA:
+        raise CaseError(
+            f"line {ln}: 'depth_stratum' must be one of "
+            f"{', '.join(_REPLAY_STRATA)}, got {depth_stratum!r}")
+    ref_tokens = _require(obj, "ref_tokens", ln)
+    if not isinstance(ref_tokens, int) or isinstance(ref_tokens, bool):
+        raise CaseError(f"line {ln}: 'ref_tokens' must be an integer")
+    reference = _require(obj, "reference", ln)
+    if not isinstance(reference, dict):
+        raise CaseError(f"line {ln}: 'reference' must be an object")
+    if "acted" not in reference or not isinstance(reference["acted"], bool):
+        raise CaseError(f"line {ln}: reference.acted must be a boolean")
+    if not isinstance(reference.get("tools"), list):
+        raise CaseError(f"line {ln}: reference.tools must be a list")
+    if not isinstance(reference.get("arguments"), list):
+        raise CaseError(f"line {ln}: reference.arguments must be a list")
+    return ReplayCase(id=cid, capture_path=capture_path, chain_id=chain_id,
+                      depth_stratum=depth_stratum, ref_tokens=ref_tokens,
+                      reference=reference,
+                      reference_model=obj.get("reference_model"))
+
+
 def load_cases(path: str, profile: str) -> list:
     # chore: reuses the constraints loader/runner. Checks are compliance-only
     # (length, format, forbidden prefixes). The profile discriminates: 14B
@@ -280,7 +330,8 @@ def load_cases(path: str, profile: str) -> list:
     # and was wrong.
     loader = {"constraints": _load_constraint_line,
               "chore": _load_constraint_line,
-              "tool-calling": _load_tool_line}.get(profile)
+              "tool-calling": _load_tool_line,
+              "main-replay": _load_replay_line}.get(profile)
     if loader is None:
         raise CaseError(f"unknown profile '{profile}'")
     cases = []
@@ -373,6 +424,10 @@ def _call_from_name_obj(obj: Optional[dict], detail: str,
 
 
 def parse_native(text: str) -> ParsedCall:
+    # TODO: Only recognises JSON inside the tool_call tag pair and the
+    # python_tag marker. The function=/parameter= XML family used by some
+    # serving harnesses is not parsed. Moot for increment 1 (no model runs
+    # native), but needs addressing before native replay.
     if not text.strip():
         return ParsedCall(False, None, None, "truncated")
     m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL)
@@ -442,6 +497,278 @@ def _rate(vals: list) -> Optional[float]:
 def aggregate_tool(per_case: list) -> dict:
     dims = ["well_formed", "right_tool", "args_ok", "abstained_ok"]
     return {d: _rate([c[d] for c in per_case]) for d in dims}
+
+
+# ---------------------------------------------------------------------------
+# main-replay tier-0 scoring
+# ---------------------------------------------------------------------------
+
+# JSON schema "type" -> python type. Note: python's bool is a subclass of int,
+# so integer/number checks must explicitly reject bools (see _check_args_schema).
+_JSON_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def _capture_tool_names(capture_tools: list) -> set:
+    names = set()
+    for t in capture_tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", {})
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def _capture_tool_params(capture_tools: list, tool_name: str) -> Optional[dict]:
+    """Return the JSON-schema `parameters` object for `tool_name`, or None."""
+    for t in capture_tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", {})
+        if isinstance(fn, dict) and fn.get("name") == tool_name:
+            params = fn.get("parameters", {})
+            return params if isinstance(params, dict) else {}
+    return None
+
+
+def _check_args_schema(args, properties, required) -> bool:
+    """Schema validation: required keys present, no hallucinated keys, types match.
+
+    Deliberately NOT exact-value equality (unlike score_tool_call): at a real
+    mid-session decision point there is no single correct argument value, but
+    there is exactly one schema.
+    """
+    if not isinstance(args, dict):
+        return False
+    for r in (required or []):
+        if r not in args:
+            return False
+    props = properties or {}
+    # no hallucinated keys
+    for k in args:
+        if k not in props:
+            return False
+    # types match
+    for k, v in args.items():
+        schema = props.get(k, {})
+        if not isinstance(schema, dict):
+            continue
+        t = schema.get("type")
+        if t is None:
+            continue
+        types = t if isinstance(t, list) else [t]
+        matched = False
+        for ti in types:
+            expected = _JSON_TYPE_MAP.get(ti)
+            if expected is None:
+                # unknown type name — don't fail on what we can't check
+                matched = True
+                break
+            # bool is a subclass of int in python; JSON integer/number must
+            # reject a bool value.
+            if ti in ("integer", "number") and isinstance(v, bool):
+                continue
+            if isinstance(v, expected):
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def score_replay_call(parsed: "ParsedCall", case: "ReplayCase",
+                      capture_tools: list, closed: bool = True) -> dict:
+    """Tier-0 mechanical validity for a main-replay case.
+
+    Returns:
+        acted_ok, well_formed, tool_exists (bool), args_schema_ok (bool|None),
+        action_valid (bool).
+    """
+    if not closed:
+        # thinking budget exhausted — nothing was produced to check. acted_ok
+        # is False (it did not act); the remaining dimensions are not
+        # applicable (no action was produced), so they are None per the
+        # dimension-applicability rule.
+        return {"acted_ok": False, "well_formed": None, "tool_exists": None,
+                "args_schema_ok": None, "action_valid": False}
+
+    ref = case.reference
+    ref_acted = bool(ref.get("acted"))
+    candidate_attempted = parsed.attempted  # a structure was present or a call parsed
+    candidate_acted = parsed.tool is not None  # a well-formed tool call was made
+
+    if not candidate_attempted:
+        # Model chose prose, never attempted a call. acted_ok: did the model
+        # do the right thing (act vs prose)? well_formed/tool_exists/
+        # args_schema_ok are not applicable (no action to check).
+        acted_ok = not ref_acted  # correct iff reference also didn't act
+        return {"acted_ok": acted_ok, "well_formed": None,
+                "tool_exists": None, "args_schema_ok": None,
+                "action_valid": acted_ok}
+
+    # Model attempted a call (well-formed or not). acted_ok is correct iff
+    # the reference acted (the model tried to act when it should).
+    acted_ok = ref_acted
+    well_formed = parsed.well_formed  # meaningful: did the attempt parse?
+
+    if not candidate_acted:
+        # Attempted but failed to produce a well-formed call.
+        return {"acted_ok": acted_ok, "well_formed": well_formed,
+                "tool_exists": None, "args_schema_ok": None,
+                "action_valid": False}  # not well_formed → not valid
+
+    tool_names = _capture_tool_names(capture_tools)
+    tool_exists = parsed.tool in tool_names
+
+    args_schema_ok: Optional[bool]
+    if not tool_exists:
+        # tool not in the capture's tools — can't validate its schema.
+        args_schema_ok = None
+    else:
+        params = _capture_tool_params(capture_tools, parsed.tool)
+        if params is None:
+            args_schema_ok = None
+        else:
+            args_schema_ok = _check_args_schema(
+                parsed.arguments or {}, params.get("properties"),
+                params.get("required"))
+
+    action_valid = acted_ok and well_formed and tool_exists
+    if args_schema_ok is not None:
+        action_valid = action_valid and args_schema_ok
+    return {"acted_ok": acted_ok, "well_formed": well_formed,
+            "tool_exists": tool_exists, "args_schema_ok": args_schema_ok,
+            "action_valid": action_valid}
+
+
+def load_replay_meta(cases_path: str) -> dict | None:
+    """Read the extractor's ``<stem>.meta.json`` sibling of a case file.
+
+    Returns the meta dict when present and its depth_weights are usable
+    (strata keys, numeric values, positive sum), else None — and with no
+    weights the aggregate reports action_valid_weighted as None with
+    depth_weights_source "missing", per the applicability rule: a number we
+    cannot compute is None, never a stale stand-in.
+    """
+    meta_path = os.path.splitext(cases_path)[0] + ".meta.json"
+    try:
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    weights = meta.get("depth_weights")
+    if (isinstance(weights, dict)
+            and set(weights) <= set(_REPLAY_STRATA)
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and v >= 0 for v in weights.values())
+            and sum(weights.values()) > 0):
+        return meta
+    return None
+
+
+def aggregate_replay(per_case: list, depth_weights: dict | None = None) -> dict:
+    """Aggregate main-replay tier-0 results.
+
+    `per_case` is a list of score dicts (from score_replay_call), each
+    optionally carrying `depth_stratum` and `chain_id` keys for breakdowns.
+
+    The headline `action_valid_weighted` is Σ stratum_rate × depth_weight over
+    in-scope strata (those with cases), renormalized by the weight those strata
+    carry — an absent stratum narrows the claim instead of silently dragging
+    the number toward zero (a perfect shallow-only sample is 1.0, not 0.075).
+    `depth_weight_coverage` (Σ weight over strata with cases) reports how much
+    of the traffic mix the number represents; 1.0 when all three strata have
+    cases. No unweighted pooled number exists — a pooled rate over an equal-N
+    sample describes a traffic mix that does not exist. Per-stratum and
+    per-chain rates are unweighted (passes/n); only the top-level number is
+    weighted.
+    """
+    n_cases = len(per_case)
+    dims = ["acted_ok", "well_formed", "tool_exists", "args_schema_ok"]
+    by_dimension = {}
+    for d in dims:
+        vals = [c.get(d) for c in per_case]
+        present = [v for v in vals if v is not None]
+        rate = (sum(1 for v in present if v) / len(present)) if present else None
+        by_dimension[d] = {"rate": rate, "n_applicable": len(present)}
+
+    by_depth: dict = {}
+    for stratum in _REPLAY_STRATA:
+        rows = [c for c in per_case if c.get("depth_stratum") == stratum]
+        n = len(rows)
+        if n:
+            rate = sum(1 for c in rows if c.get("action_valid")) / n
+        else:
+            rate = 0.0
+        by_depth[stratum] = {"action_valid": rate, "n": n}
+
+    # Weighted headline: Σ stratum_rate × depth_weight over strata with cases,
+    # renormalized over the weight actually present. Coverage is reported
+    # alongside so consumers can see how much of the mix the number spans.
+    if depth_weights is None:
+        # No observed weights: the weighted headline is not computable.
+        # None, never a stale stand-in — the same applicability rule the
+        # per-case dimensions follow.
+        action_valid_weighted = None
+        weight_present = None
+        weights_used = None
+        weights_source = "missing"
+    else:
+        weights_used = depth_weights
+        weights_source = "corpus-meta"
+        weighted_sum = 0.0
+        weight_present = 0.0
+        for stratum, weight in weights_used.items():
+            d = by_depth.get(stratum) or {}
+            if d.get("n", 0):
+                weighted_sum += d["action_valid"] * weight
+                weight_present += weight
+        action_valid_weighted = (
+            (weighted_sum / weight_present) if weight_present else 0.0)
+
+    by_chain: dict = {}
+    for c in per_case:
+        cid = c.get("chain_id")
+        if cid is None:
+            continue
+        by_chain.setdefault(cid, []).append(c.get("action_valid"))
+    by_chain = {cid: {"action_valid": (sum(1 for v in vals if v)
+                                       / len(vals) if vals else 0.0),
+                      "n": len(vals)}
+                for cid, vals in by_chain.items()}
+
+    # Derived from the per-case records (which carry the case file's value):
+    # unanimous -> that value, mixed -> sorted list, absent -> None.
+    ref_models = sorted({c["reference_model"] for c in per_case
+                         if c.get("reference_model")})
+    if not ref_models:
+        reference_model = None
+    elif len(ref_models) == 1:
+        reference_model = ref_models[0]
+    else:
+        reference_model = ref_models
+
+    return {
+        "action_valid_weighted": action_valid_weighted,
+        "depth_weight_coverage": weight_present,
+        "by_dimension": by_dimension,
+        "by_depth": by_depth,
+        "by_chain": by_chain,
+        "reference_model": reference_model,
+        "depth_weights": dict(weights_used) if weights_used else None,
+        "depth_weights_source": weights_source,
+        "n_cases": n_cases,
+    }
 
 
 def strip_thinking(text: str) -> tuple[str, bool]:
@@ -538,6 +865,77 @@ def build_constraint_prompt(tokenizer, case: "ConstraintCase",
                  enable_thinking=enable_thinking)
 
 
+def _stringify_content(messages: list) -> list:
+    """Join list-of-parts message content into plain strings.
+
+    Real captures carry OpenAI-style content arrays
+    (``[{"type": "text", "text": ...}, ...]``); chat templates assume
+    strings and crash on lists (Qwen3: ``'list object' has no attribute
+    'startswith'``). Every serving layer joins text parts before
+    templating, so this is render-faithfulness, not body mutation — the
+    capture on disk is untouched.
+    """
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            m = dict(m)
+            m["content"] = "\n".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text")
+        out.append(m)
+    return out
+
+
+def build_replay_prompt(tokenizer, case: "ReplayCase", native: bool,
+                        enable_thinking=None) -> str:
+    """Build the prompt from the captured request body.
+
+    The prompt IS the captured request: its messages array (which already
+    contains the session's system prompt) is applied to the chat template
+    directly (content-part lists joined to strings — see
+    _stringify_content). For native mode the captured `tools` array is
+    forwarded byte-verbatim. For prompted mode the ``_PROMPTED_SYSTEM``
+    convention plus the request's own tool schemas are appended as a final
+    system message — the sole deliberate deviation from body-verbatim — so
+    the model sees the JSON shape it is graded on (spec, 2026-07-28).
+    """
+    with open(case.capture_path, encoding="utf-8") as f:
+        body = json.load(f)
+    messages = _stringify_content(body["messages"])
+    if native:
+        tools = body.get("tools")
+        return _chat(tokenizer, messages, tools=tools,
+                     enable_thinking=enable_thinking)
+    # Non-native: append the prompted convention + tool schemas as a
+    # final system message so the model sees the format it is graded on.
+    # Sole deviation from body-verbatim (spec, 2026-07-28).
+    tools = body.get("tools") or []
+    schemas = json.dumps(tools, indent=2)
+    convention = _PROMPTED_SYSTEM.format(schemas=schemas)
+    messages = list(messages)  # don't mutate the captured list
+    messages.append({"role": "system", "content": convention})
+    return _chat(tokenizer, messages, tools=None,
+                 enable_thinking=enable_thinking)
+
+
+def canonical_ref_render(tokenizer, body: dict) -> str:
+    """Render a captured request body the corpus-canonical way.
+
+    One fixed convention — messages with tools forwarded natively, no
+    thinking flag — because a stratum is a property of the corpus, not of a
+    candidate. Per-candidate rendering reality is recorded separately as
+    ``prompt_tokens_fed`` (spec 2026-07-29).
+    """
+    messages = _stringify_content(body["messages"])
+    return _chat(tokenizer, messages, tools=body.get("tools"))
+
+
+def count_ref_tokens(tokenizer, body: dict) -> int:
+    """Exact token count of the canonical render under ``tokenizer``."""
+    return len(tokenizer.encode(canonical_ref_render(tokenizer, body)))
+
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
@@ -624,6 +1022,175 @@ def run_tool_calling(cases: list, tokenizer, generate_fn, native: bool,
     }
 
 
+def _fmt_secs(s: float) -> str:
+    """Compact duration: 42s, 3m20s, 1h04m."""
+    s = int(round(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def _replay_progress_line(i: int, total: int, case, outcome: str,
+                          case_secs: float, remaining: list,
+                          stratum_secs: dict, detail: str = "") -> str:
+    """Format one per-case progress line.
+
+    Carries the stratum because per-case cost varies by several multiples
+    across strata — seeing which stratum a slow case belonged to is most of
+    the diagnostic value, and it makes the ETA's variance legible rather than
+    mysterious.
+    """
+    eta = _replay_eta_secs(remaining, stratum_secs)
+    eta_s = f"  eta ~{_fmt_secs(eta)}" if eta is not None else ""
+    tail = f"  {detail}" if detail else ""
+    return (f"[{i:>3}/{total}] {getattr(case, 'id', '?'):<8} "
+            f"{getattr(case, 'depth_stratum', '?'):<8} {outcome:<14} "
+            f"{_fmt_secs(case_secs):>7}{eta_s}{tail}")
+
+
+def _replay_eta_secs(remaining: list, stratum_secs: dict) -> Optional[float]:
+    """Project remaining wall-clock, priced per stratum.
+
+    Deep cases carry 40-60k prompt tokens against a shallow case's <16k, so
+    they cost several times more. A pooled mean projected onto a stratified
+    queue is therefore wrong by whatever the remaining mix happens to be —
+    badly optimistic while the shallow cases are being drained, badly
+    pessimistic afterwards. Each remaining case is priced by its own
+    stratum's observed mean, falling back to the pooled mean for a stratum
+    that has not completed a case yet. Returns None before anything has
+    finished, rather than inventing a number from no data.
+    """
+    observed = [x for v in stratum_secs.values() for x in v]
+    if not observed:
+        return None
+    pooled_mean = sum(observed) / len(observed)
+    total = 0.0
+    for case in remaining:
+        samples = stratum_secs.get(getattr(case, "depth_stratum", None))
+        total += (sum(samples) / len(samples)) if samples else pooled_mean
+    return total
+
+
+def run_main_replay(cases: list, tokenizer, generate_fn, native: bool,
+                    enable_thinking=None, depth_weights: dict | None = None,
+                    context_length: int | None = None,
+                    progress: Optional[Callable[[str], None]] = None) -> dict:
+    """Replay captured LLM request bodies through a local model and score tier-0.
+
+    The prompt is the captured request body verbatim by reference: the runner
+    reads the capture file for `messages`, `tools`, and `max_tokens`, applies
+    the chat template, and generates with the captured `max_tokens` (32000) —
+    NOT a tight action budget. This is a deliberate parameter decision per the
+    spec: the candidate gets the same token room the serving model had.
+
+    Unlike run_tool_calling, each case runs in a single convention (native if
+    the model supports tools, prompted otherwise) — there is no paired column.
+
+    `progress` is an optional sink called with one formatted line per case as
+    it completes (the CLI passes `print`; tests leave it None so the library
+    stays quiet). A full matrix is tens of minutes to hours of wall-clock and
+    previously emitted nothing until a mode finished, so a stalled run was
+    indistinguishable from a slow one.
+    """
+    per_case_scores, records, errored = [], [], []
+    total = len(cases)
+    stratum_secs: dict = {}
+    # Resolve the context gate once, before the loop. Explicit config context
+    # takes precedence; otherwise fall back to the tokenizer's declared max
+    # when sane. Many tokenizers ship a huge sentinel (>= 10**9, transformers'
+    # "unset" convention); Qwen3's is real but wrong (the YaRN ceiling, not
+    # native context) — which is why a resolved config context takes precedence.
+    gate_limit: int | None = context_length
+    gate_source: str | None = "config" if context_length is not None else None
+    if gate_limit is None:
+        mml = getattr(tokenizer, "model_max_length", None)
+        if (isinstance(mml, int) and not isinstance(mml, bool)
+                and 0 < mml < 10**9):
+            gate_limit, gate_source = mml, "model_max_length"
+    for i, case in enumerate(cases, 1):
+        t_case = time.monotonic()
+        try:
+            with open(case.capture_path, encoding="utf-8") as f:
+                body = json.load(f)
+            max_tokens = int(body.get("max_tokens", 32000))
+            capture_tools = body.get("tools") or []
+            prompt = build_replay_prompt(tokenizer, case, native,
+                                         enable_thinking=enable_thinking)
+            # Truncation gate (F3a): record the token count the model is
+            # actually fed by encoding the rendered prompt. This is the only
+            # number that can surface silent truncation on deep cases (40–60k
+            # tokens) — ref_tokens is the extractor's reference-tokenizer
+            # count of the canonical render, not a pre-template estimate, and
+            # can't see template overhead or context-window clipping. A
+            # tokenizer without encode() (e.g. a stub) records None plus a
+            # tokens_fed_error note on the case record rather than crashing
+            # the run — a silent None would hide a broken gate.
+            tokens_fed_error = None
+            try:
+                prompt_tokens_fed = len(tokenizer.encode(prompt))
+            except Exception as te:  # noqa: BLE001 - surface, don't crash
+                prompt_tokens_fed = None
+                tokens_fed_error = f"{type(te).__name__}: {te}"
+            # Minimum gate: if a sane context length was resolved above and the
+            # rendered prompt exceeds it, scoring would grade a
+            # silently-truncated generation. Error the case instead (raising
+            # routes it through the same errored path as any other failure).
+            if (prompt_tokens_fed is not None and gate_limit is not None
+                    and prompt_tokens_fed > gate_limit):
+                raise RuntimeError(
+                    f"prompt exceeds model context: "
+                    f"{prompt_tokens_fed} > {gate_limit} ({gate_source})")
+            raw = generate_fn(prompt, max_tokens=max_tokens)
+        except Exception as e:  # noqa: BLE001 - report, don't crash the run
+            errored.append({"id": case.id, "error": str(e)})
+            if progress is not None:
+                # Errored cases are deliberately NOT fed into stratum_secs: a
+                # case that failed to render consumed no generation time, and
+                # averaging it in would make the ETA optimistic in precisely
+                # the run where things are going wrong.
+                progress(_replay_progress_line(
+                    i, total, case, "ERROR", time.monotonic() - t_case,
+                    cases[i:], stratum_secs, detail=str(e)[:60]))
+            continue
+        case_secs = time.monotonic() - t_case
+        text, closed = strip_thinking(raw)
+        parsed = parse_native(text) if native else parse_prompted(text)
+        score = score_replay_call(parsed, case, capture_tools, closed=closed)
+        # Attach depth_stratum, chain_id, reference_model so aggregate_replay
+        # can break down by stratum, chain, and report the reference model.
+        score_with_depth = dict(score)
+        score_with_depth["depth_stratum"] = case.depth_stratum
+        score_with_depth["chain_id"] = case.chain_id
+        score_with_depth["reference_model"] = case.reference_model
+        per_case_scores.append(score_with_depth)
+        rec = {
+            "id": case.id, "chain_id": case.chain_id,
+            "depth_stratum": case.depth_stratum, "native": native,
+            "score": score, "output_sample": text[:200],
+            "thinking_unclosed": not closed,
+            "prompt_tokens_fed": prompt_tokens_fed,
+            "ref_tokens": case.ref_tokens,
+        }
+        if tokens_fed_error is not None:
+            rec["tokens_fed_error"] = tokens_fed_error
+        rec["case_secs"] = round(case_secs, 2)
+        records.append(rec)
+        stratum_secs.setdefault(case.depth_stratum, []).append(case_secs)
+        if progress is not None:
+            av = score.get("action_valid")
+            outcome = "valid" if av else ("unclosed-think" if not closed
+                                          else "invalid")
+            progress(_replay_progress_line(
+                i, total, case, outcome, case_secs, cases[i:], stratum_secs))
+    return {"aggregate": aggregate_replay(per_case_scores,
+                                          depth_weights=depth_weights),
+            "cases": records, "errored": errored,
+            "context_length": gate_limit,
+            "context_length_source": gate_source}
+
+
 # ---------------------------------------------------------------------------
 # output
 # ---------------------------------------------------------------------------
@@ -663,11 +1230,51 @@ def format_constraint_table(label: str, result: dict) -> str:
     return "\n".join(lines)
 
 
+def format_replay_table(label: str, result: dict) -> str:
+    agg = result["aggregate"]
+    avw = agg.get("action_valid_weighted")
+    headline = (f"{label}:  action_valid_weighted="
+                + (f"{avw:.2f}" if avw is not None
+                   else "n/a (weights missing)")
+                + f"  (n={agg['n_cases']})")
+    coverage = agg.get("depth_weight_coverage")
+    if coverage is not None and coverage < 1.0:
+        # The renormalized headline only speaks for the strata that have
+        # cases — flag how much of the traffic mix that is.
+        headline += f"  coverage={coverage:.2f} — missing strata"
+    lines = [headline]
+    dims = agg.get("by_dimension") or {}
+    if dims:
+        parts = []
+        for k, v in dims.items():
+            if isinstance(v, dict):
+                rate = v.get("rate")
+                n = v.get("n_applicable", 0)
+                parts.append(f"{k}={_fmt(rate)}(n={n})")
+            else:
+                parts.append(f"{k}={_fmt(v)}")
+        lines.append("  by dimension: " + "  ".join(parts))
+    by_depth = agg.get("by_depth") or {}
+    if by_depth:
+        parts = []
+        for s in ("shallow", "mid", "deep"):
+            d = by_depth.get(s) or {}
+            parts.append(f"{s}={_fmt(d.get('action_valid'))}"
+                         f"(n={d.get('n', 0)})")
+        lines.append("  by depth: " + "  ".join(parts))
+    if result["errored"]:
+        lines.append(f"  errored: {len(result['errored'])} case(s)")
+    return "\n".join(lines)
+
+
 def _headline(result: dict, profile: str) -> float:
     """The one number a thinking/no-thinking comparison turns on."""
     agg = result["aggregate"]
     if profile in ("constraints", "chore"):
         return agg["strict"] or 0.0
+    if profile == "main-replay":
+        # May be None when depth weights were missing; callers must guard.
+        return agg.get("action_valid_weighted")
     return (agg["prompted"] or {}).get("right_tool") or 0.0
 
 
@@ -680,16 +1287,20 @@ def format_thinking_gap(label: str, per_mode: dict, profile: str,
     on the line.
     """
     off, on = per_mode["no-think"], per_mode["think"]
-    gap = _headline(on, profile) - _headline(off, profile)
-    metric = "strict" if profile in ("constraints", "chore") else "right_tool"
+    h_off, h_on = _headline(off, profile), _headline(on, profile)
+    metric = ("strict" if profile in ("constraints", "chore")
+              else "action_valid_weighted" if profile == "main-replay"
+              else "right_tool")
     t_off = tokens_per_case.get("no-think") or 0.0
     t_on = tokens_per_case.get("think") or 0.0
     cost = f"{t_off:.0f} -> {t_on:.0f} tok/case"
     if t_off > 0:
         cost += f" ({t_on / t_off:.1f}x)"
-    return (f"{label}: thinking gap({metric})={gap:+.2f}  "
-            f"[no-think={_headline(off, profile):.2f}  "
-            f"think={_headline(on, profile):.2f}]  cost: {cost}")
+    if h_off is None or h_on is None:
+        return (f"{label}: thinking gap({metric})=n/a (weights missing)  "
+                f"cost: {cost}")
+    return (f"{label}: thinking gap({metric})={h_on - h_off:+.2f}  "
+            f"[no-think={h_off:.2f}  think={h_on:.2f}]  cost: {cost}")
 
 
 def write_sidecar(path: str, profile: str, model: str, label: str,
@@ -708,6 +1319,8 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
         "cases": result.get("cases", []),
         "errored": result.get("errored", []),
     }
+    payload["context_length"] = result.get("context_length")
+    payload["context_length_source"] = result.get("context_length_source")
     if cost:
         payload["load_ms"] = cost.get("load_ms")
         payload["peak_memory_mb"] = cost.get("peak_memory_mb")
@@ -735,15 +1348,17 @@ def write_sidecar(path: str, profile: str, model: str, label: str,
 # ---------------------------------------------------------------------------
 
 import argparse
-import os
 import statistics
 
 DEFAULT_CASES = {
     "tool-calling": "cases/tool_calling.jsonl",
     "constraints": "cases/constraints.jsonl",
     "chore": "cases/chore.jsonl",
+    "main-replay": "cases/main_replay.jsonl",
 }
 DEFAULT_MAX_TOKENS = {"tool-calling": 128, "constraints": 512, "chore": 64}
+# main-replay is deliberately absent: max_tokens comes from the captured body
+# (32000), NOT from the CLI. The runner reads body["max_tokens"] per case.
 
 # Reasoning models need room for the scratchpad on top of the answer. Measured
 # on Ternary-Bonsai-27B-mlx-2bit (2026-07-15): the <think> preamble alone runs
@@ -757,12 +1372,13 @@ THINKING_MAX_TOKENS = {"tool-calling": 2048, "constraints": 1536, "chore": 4096}
 
 
 def main() -> None:
-    from litmus_common import get_backend, _targets_for
+    from litmus_common import get_backend, _targets_for, resolve_context_length
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", required=True,
-                    choices=["tool-calling", "constraints", "chore"])
+                    choices=["tool-calling", "constraints", "chore",
+                             "main-replay"])
     ap.add_argument("--cases", default=None, help="JSONL case file (default per profile)")
     ap.add_argument("--sizes", default="1.7B,4B,8B")
     ap.add_argument("--repo", default=None)
@@ -777,11 +1393,28 @@ def main() -> None:
     args = ap.parse_args()
 
     cases_path = args.cases or DEFAULT_CASES[args.profile]
-    max_tokens = args.max_tokens or DEFAULT_MAX_TOKENS[args.profile]
-    think_max_tokens = (args.think_max_tokens
-                        or THINKING_MAX_TOKENS[args.profile])
+    if args.profile == "main-replay":
+        # max_tokens comes from the captured body (32000), not the CLI. The
+        # budgets below are only display placeholders; the per-case budget is
+        # read by run_main_replay from each capture file.
+        max_tokens = None
+        think_max_tokens = None
+    else:
+        max_tokens = args.max_tokens or DEFAULT_MAX_TOKENS[args.profile]
+        think_max_tokens = (args.think_max_tokens
+                            or THINKING_MAX_TOKENS[args.profile])
     cases = load_cases(cases_path, args.profile)   # fail-fast before loading a model
     print(f"loaded {len(cases)} cases from {cases_path}")
+    replay_weights = None
+    if args.profile == "main-replay":
+        replay_meta = load_replay_meta(cases_path)
+        if replay_meta is not None:
+            replay_weights = replay_meta["depth_weights"]
+            print(f"depth weights from corpus meta: {replay_weights}")
+        else:
+            print("no usable .meta.json beside case file — depth weights "
+                  "missing, action_valid_weighted will be null "
+                  "(depth_weights_source=missing)")
 
     backend = get_backend(args.backend)
     for label, repo in _targets_for(args):
@@ -791,7 +1424,7 @@ def main() -> None:
         print(f"loaded in {t_load:.1f}s")
 
         thinking = supports_thinking(tokenizer)
-        native = (args.profile == "tool-calling"
+        native = (args.profile in ("tool-calling", "main-replay")
                   and supports_native_tools(tokenizer))
         conv = {"prompted": True, "native": native, "thinking": thinking}
 
@@ -811,22 +1444,45 @@ def main() -> None:
         for mode, flag, budget in modes:
             tally = {"tokens": 0, "calls": 0, "latencies": [], "gen_seconds": 0.0}
 
-            def gen(p, _budget=budget, _tally=tally,
-                    _model=model, _tok=tokenizer):
-                t0 = time.perf_counter()
-                text = "".join(backend.stream(_model, _tok, p, _budget))
-                elapsed = time.perf_counter() - t0
-                _tally["latencies"].append(elapsed * 1000)
-                _tally["gen_seconds"] += elapsed
-                _tally["tokens"] += len(_tok.encode(text))
-                _tally["calls"] += 1
-                return text
+            if args.profile == "main-replay":
+                # main-replay's budget comes from each capture's body
+                # (max_tokens=32000), not the CLI mode budget. The gen closure
+                # accepts max_tokens as a kwarg from run_main_replay.
+                def gen(p, max_tokens=32000, _tally=tally,
+                        _model=model, _tok=tokenizer):
+                    t0 = time.perf_counter()
+                    text = "".join(backend.stream(_model, _tok, p, max_tokens))
+                    elapsed = time.perf_counter() - t0
+                    _tally["latencies"].append(elapsed * 1000)
+                    _tally["gen_seconds"] += elapsed
+                    _tally["tokens"] += len(_tok.encode(text))
+                    _tally["calls"] += 1
+                    return text
+            else:
+                def gen(p, _budget=budget, _tally=tally,
+                        _model=model, _tok=tokenizer):
+                    t0 = time.perf_counter()
+                    text = "".join(backend.stream(_model, _tok, p, _budget))
+                    elapsed = time.perf_counter() - t0
+                    _tally["latencies"].append(elapsed * 1000)
+                    _tally["gen_seconds"] += elapsed
+                    _tally["tokens"] += len(_tok.encode(text))
+                    _tally["calls"] += 1
+                    return text
 
-            print(f"\n--- {label} [{mode}] (max_tokens={budget}) ---")
+            budget_display = "capture (per-case)" if args.profile == "main-replay" else budget
+            print(f"\n--- {label} [{mode}] (max_tokens={budget_display}) ---")
             if args.profile in ("constraints", "chore"):
                 result = run_constraints(cases, tokenizer, gen,
                                          enable_thinking=flag)
                 print(format_constraint_table(f"{label} [{mode}]", result))
+            elif args.profile == "main-replay":
+                result = run_main_replay(cases, tokenizer, gen, native=native,
+                                         enable_thinking=flag,
+                                         depth_weights=replay_weights,
+                                         context_length=resolve_context_length(repo),
+                                         progress=print)
+                print(format_replay_table(f"{label} [{mode}]", result))
             else:
                 result = run_tool_calling(cases, tokenizer, gen, native=native,
                                           enable_thinking=flag)
