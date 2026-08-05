@@ -1,0 +1,84 @@
+{
+  "tokenizer": "mlx-community/Qwen3-14B-4bit",
+  "cases_path": "cases/main_replay.jsonl",
+  "safety": 0.95,
+  "recommended_divisor": 3.39,
+  "n_cases": 15,
+  "cases": [
+    {
+      "id": "mr-001",
+      "chars": 41525,
+      "ref_tokens": 9880
+    },
+    {
+      "id": "mr-002",
+      "chars": 46727,
+      "ref_tokens": 11088
+    },
+    {
+      "id": "mr-003",
+      "chars": 49219,
+      "ref_tokens": 11647
+    },
+    {
+      "id": "mr-004",
+      "chars": 50991,
+      "ref_tokens": 12111
+    },
+    {
+      "id": "mr-005",
+      "chars": 41141,
+      "ref_tokens": 9807
+    },
+    {
+      "id": "mr-006",
+      "chars": 60018,
+      "ref_tokens": 16289
+    },
+    {
+      "id": "mr-007",
+      "chars": 91332,
+      "ref_tokens": 24166
+    },
+    {
+      "id": "mr-008",
+      "chars": 74570,
+      "ref_tokens": 17443
+    },
+    {
+      "id": "mr-009",
+      "chars": 104909,
+      "ref_tokens": 28758
+    },
+    {
+      "id": "mr-010",
+      "chars": 94609,
+      "ref_tokens": 26093
+    },
+    {
+      "id": "mr-011",
+      "chars": 140262,
+      "ref_tokens": 37574
+    },
+    {
+      "id": "mr-012",
+      "chars": 137145,
+      "ref_tokens": 36432
+    },
+    {
+      "id": "mr-013",
+      "chars": 126118,
+      "ref_tokens": 35284
+    },
+    {
+      "id": "mr-014",
+      "chars": 134193,
+      "ref_tokens": 36305
+    },
+    {
+      "id": "mr-015",
+      "chars": 118894,
+      "ref_tokens": 32112
+    }
+  ]
+}
